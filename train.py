@@ -748,6 +748,10 @@ def train(args: argparse.Namespace):
         "gif_path": gif_path,
         "checkpoint": str(checkpoint_path(args, out)),
     }
+    if gif_path and Path(gif_path).suffix.lower() == ".gif":
+        run_info["gif_size_mb"] = round(
+            Path(gif_path).stat().st_size / 1024**2, 1
+        )
     (out / "run.json").write_text(json.dumps(run_info, indent=2) + "\n")
     print(f"training finished in {elapsed:.1f}s")
 
