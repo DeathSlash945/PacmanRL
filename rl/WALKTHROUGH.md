@@ -433,16 +433,17 @@ deterministically with `np.argmax`, so the evaluation is reproducible.
 
 ```python
 nn.Conv2d(8, 32, kernel_size=3, padding=1)
-nn.Conv2d(32, 64, kernel_size=3, stride=2, padding=1)
-nn.Conv2d(64, 64, kernel_size=3, stride=2, padding=1)
+nn.Conv2d(32, width, kernel_size=3, stride=2, padding=1)
+nn.Conv2d(width, width, kernel_size=3, stride=2, padding=1)
 ```
 
 - The first convolution looks at 3x3 patches and learns local patterns
   such as "wall next to a pellet" or "ghost two tiles away".
 - The two stride-2 layers halve the spatial size twice: 31x28 -> 16x14
   -> 8x7.  This keeps the fully connected layer small.
-- 32/64/64 channels are enough for a maze this small.  A wider network
-  was measured at 1.4x slower with no clear benefit at this stage.
+- `width` is 64 by default and 32 in the reported DQN runs.  A width-64
+  network was measured at about 1.4x slower with no clear benefit for
+  this maze, so the final 1M-decision runs use width 32.
 
 ```python
 features = self.conv(grid)
@@ -728,3 +729,130 @@ A2C is the same idea without the clipped update and with a shorter
 rollout.  DPO is not a standard online RL algorithm for this setting; it
 is preference optimisation for generative models, so it is not the next
 step for Pac-Man.
+
+---
+
+## 11. `train.py`: one-file train, GIF, evaluate, live play
+
+`train.py` is the only new top-level file.  It is intentionally a thin
+orchestrator: all game logic and all RL algorithms stay in the tested
+`rl/` package.
+
+### 11.1 SDL setup before importing pygame
+
+```python
+_HEADLESS_FLAG = "--headless" in sys.argv
+_NO_DISPLAY = not (os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+if _HEADLESS_FLAG or _NO_DISPLAY:
+    os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
+```
+
+SDL reads `SDL_VIDEODRIVER` when the video subsystem is initialised, not
+when `pygame` is imported.  Setting it *before* `import pygame` removes
+any ambiguity.  On a desktop the variable is left alone, so the final
+game opens a normal window.  On a server, or with `--headless`, pygame
+still creates surfaces and fonts, but no display is required.
+
+### 11.2 Drawing to a surface
+
+`draw_game()` mirrors `game.py`'s `draw()` but takes a `Surface` argument.
+Training calls it on a 224x288 off-screen surface; the live game calls it
+on the display surface after `set_maze_scale()`.  It uses the original
+`map.build_walls`, `map.draw_pellets`, `Pacman.draw` and `Ghost.draw`, so
+the visual is the real game, not a reimplementation.
+
+`set_maze_scale()` writes `map.winScale`, `gridSize`, `offset_y`, `t`
+and `r`.  These are drawing-only globals; game physics never reads them.
+Training uses scale 1, the live window uses scale 3 by default so the
+whole 224x288 board fits on a laptop screen.
+
+### 11.3 Streaming GIF recorder
+
+A list of 100,000 frames at 224x288 would be about 19 GB of raw RGB and
+far more as Python objects.  `FFmpegGIFRecorder` instead starts ffmpeg
+with `stdin=PIPE` and writes one frame at a time:
+
+```text
+PyGame Surface -> pg.image.tobytes(..., "RGB") -> ffmpeg rawvideo -> MP4
+MP4 -> palettegen -> paletteuse -> GIF
+```
+
+The first pass is lossless-enough H.264 at `-crf 26`; the GIF stage then
+runs two separate ffmpeg commands: `palettegen` writes a small palette
+PNG, and `paletteuse` applies it with a Bayer dither.  The two passes are
+deliberately separate.  A single `palettegen+paletteuse` filter graph
+makes `paletteuse` buffer every frame while it waits for the palette,
+which is fine for a short clip but gets OOM-killed on 100,000 frames.
+Two passes keep memory bounded.  This is also smaller than Pillow's
+per-frame quantisation.
+
+The recorder checks free disk space every 2,000 frames.  If the disk is
+nearly full it stops capturing and leaves the checkpoint intact; training
+does not crash.  The intermediate MP4 is deleted after a successful GIF
+unless `--keep-mp4` is passed.
+
+### 11.4 How 100,000 frames are chosen
+
+```python
+record_every = max(1, args.total_decisions // args.gif_frames)
+```
+
+With the defaults (`1,000,000` decisions, `100,000` frames) this is 10:
+one frame after every tenth decision.  One decision is four game frames,
+so consecutive GIF frames are 40 game frames apart.  The GIF is therefore
+a timelapse of the whole training run, not 28 minutes of one episode.  If
+`--total-decisions` is smaller than `--gif-frames`, every decision is
+captured and the GIF has fewer than 100,000 frames; it cannot invent
+frames that were never played.
+
+Frames are captured before `env.reset()`, so the terminal frame of each
+episode (death or level clear) is included.
+
+### 11.5 Training loop
+
+The loop is deliberately the same as `train_dqn.py` / `train_q.py`:
+
+1. Q-learning builds its compact state from `env.game`; DQN uses the
+   observation returned by `env.step()`.
+2. During DQN warmup the action is uniformly random and only fills the
+   replay buffer.
+3. `env.step(action)` advances four game frames and returns the summed
+   reward.
+4. Q-learning updates immediately; DQN stores the transition, decays
+   epsilon, and takes one gradient step every `--train-every` decisions.
+5. On `done`, the episode row is written to `episodes.csv`.
+6. Every `--save-every` decisions the checkpoint is overwritten.
+
+`terminal = done and not info["truncated"]` is important: a time-limit
+truncation is not a real terminal state, so the Q target still
+bootstraps from the next observation.  A death or level clear is
+terminal and does not bootstrap.
+
+### 11.6 Checkpoint and evaluation
+
+The checkpoint is `dqn.pt` or `q.pkl` in `--out`.  `run.json` records the
+configuration and elapsed time.  After the GIF is finalised, the script
+runs `rl.evaluate.evaluate()` on the fixed seeds `10000..10000+N-1`,
+exactly like the report experiments.  `--eval-episodes 0` skips this if
+you want the live game immediately.
+
+Reward settings come from `rl/config.RewardConfig`.  `--score-scale` and
+`--death-penalty` override them for one run without editing the shared
+config.  For example, the report's experiments used
+`--score-scale 0.01 --death-penalty -5`.
+
+### 11.7 Live game
+
+The live game uses a fresh `Game(fx=True)`, which restores READY!, death
+pauses and score popups.  It does not use `PacmanEnv`, so it is not
+limited by `level_cap=1` and will continue into level 2+ if Pac-Man
+clears the board.  The loop:
+
+1. asks the greedy policy for a direction every four frames;
+2. calls `pacman.set_dir(...)` and `game.update()`;
+3. draws and waits for 60 FPS;
+4. stops when `game.game_over` is true, i.e. after all three lives.
+
+`--live-max-frames` is a safety cap for automated tests; the default `0`
+means "play until death", as requested.  `--no-watch` runs the same loop
+without a window, which is how the script is tested on a headless server.

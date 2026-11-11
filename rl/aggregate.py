@@ -76,7 +76,8 @@ def main():
         values = [summary[name][metric]["mean"] for name in names]
         errors = [summary[name][metric]["std"] for name in names]
         ax.bar(names, values, yerr=errors, capsize=6,
-               color=["tab:blue" if "Q" in n else "tab:orange" for n in names])
+               color=["tab:blue" if n.startswith("Q") else "tab:orange"
+                      for n in names])
         ax.set_title(metric)
         ax.grid(axis="y", alpha=0.3)
     fig.suptitle("Final greedy evaluation (mean +/- std across training seeds)")

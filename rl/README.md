@@ -25,6 +25,38 @@ The original game files (`env.py`, `pacman.py`, `ghost.py`, `map.py`,
 | `watch.py` | watch a trained agent in pygame |
 | `record.py` | record a trained agent to an animated GIF |
 
+The single-file entry point is one directory up:
+
+| File | Purpose |
+| --- | --- |
+| `../train.py` | from-scratch DQN/Q-learning training, 100k-frame training GIF, checkpoint, fixed-seed evaluation, then a live game until death |
+
+Run it from the project root:
+
+```bash
+# DQN, 1M decisions, 100,000-frame training GIF, live game at the end
+/home/deathslash/venvs/mlasgn/bin/python train.py
+
+# No display / server: still trains, records and evaluates, no window
+/home/deathslash/venvs/mlasgn/bin/python train.py --headless --no-watch
+
+# Fast smoke test
+/home/deathslash/venvs/mlasgn/bin/python train.py --agent q \
+  --total-decisions 2000 --gif-frames 200 --eval-episodes 2 --no-watch
+
+# Reproduce the reward values used in REPORT.md, even if rl/config.py
+# has since been tuned
+/home/deathslash/venvs/mlasgn/bin/python train.py \
+  --score-scale 0.01 --death-penalty -5
+```
+
+The GIF is a training timelapse: with the defaults it captures one frame
+every 10 decisions, so 1M decisions produce exactly 100,000 frames.  Frames
+are streamed to ffmpeg instead of being kept in RAM.  The palette pass and
+the palette-application pass are separate, which keeps memory bounded for
+a 100,000-frame clip.  The native 224x288 GIF is about 300 MiB; use
+`--gif-width 140 --gif-height 180` for a smaller one.
+
 ## Observation
 
 `obs = {"grid": float32[8,31,28], "vec": float32[18]}`.

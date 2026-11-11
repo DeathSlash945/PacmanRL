@@ -9,8 +9,8 @@ Deep Q-Network agent, and compare them on identical evaluation seeds.
 | Agent | Eval score | Pellets eaten | Survival (frames) | Deaths | Level clears |
 | --- | ---: | ---: | ---: | ---: | ---: |
 | Random | 342 ± 0 | 34.2 ± 0 | 2057 ± 0 | 3.0 | 0 |
-| Q-learning (3M decisions, 3 seeds) | 1588 ± 105 | 129.8 ± 13.4 | 3690 ± 663 | 3.0 | 0 |
-| DQN (1M decisions, 3 seeds) | TBD | TBD | TBD | TBD | TBD |
+| Q-learning (3M decisions, 3 seeds) | 1791 ± 247 | 141.2 ± 27.5 | 3995 ± 181 | 3.0 | 0 |
+| DQN (1M decisions, 3 seeds) | 2285 ± 375 | 170.3 ± 10.3 | 3068 ± 267 | 3.0 | 0 |
 
 (Mean over 30 fixed evaluation seeds. Full numbers and standard
 deviations are in the results section below.)
@@ -25,6 +25,8 @@ deviations are in the results section below.)
 - `rl/evaluate.py`, `rl/eval_agent.py`: fixed-seed evaluation.
 - `rl/plot.py`: learning-curve comparison.
 - `rl/watch.py`: watch a trained agent in pygame.
+- `train.py`: one-file from-scratch training, 100,000-frame training GIF,
+  final evaluation and a live game that plays until all lives are gone.
 - `rl/WALKTHROUGH.md`: line-by-line explanation of every design choice.
 
 The original files `env.py`, `pacman.py`, `ghost.py`, `map.py`,
@@ -58,7 +60,7 @@ The original files `env.py`, `pacman.py`, `ghost.py`, `map.py`,
 
 | Parameter | Value |
 | --- | --- |
-| network | 3 conv layers (32/64/64) + 512-unit head |
+| network | 3 conv layers (32/32/32, `width=32`) + 512-unit head |
 | replay | 100,000 transitions, int8 observations |
 | batch | 64 |
 | optimizer | Adam, lr 1e-4 |
@@ -75,42 +77,66 @@ The original files `env.py`, `pacman.py`, `ghost.py`, `map.py`,
 | Agent | Score | Pellets | Survival (frames) |
 | --- | ---: | ---: | ---: |
 | Q-learning, 1M (3 seeds) | 1528 ± 101 | 125.7 ± 12.1 | 3437 ± 277 |
-| DQN, 1M (3 seeds) | TBD | TBD | TBD |
+| DQN, 1M (3 seeds) | 2285 ± 375 | 170.3 ± 10.3 | 3068 ± 267 |
 
 ### Final-budget comparison
 
 | Agent | Score | Pellets | Survival (frames) |
 | --- | ---: | ---: | ---: |
-| Q-learning, 3M (3 seeds) | 1588 ± 105 | 129.8 ± 13.4 | 3690 ± 663 |
-| DQN, 1M (3 seeds) | TBD | TBD | TBD |
+| Q-learning, 3M (3 seeds) | 1791 ± 247 | 141.2 ± 27.5 | 3995 ± 181 |
+| DQN, 1M (3 seeds) | 2285 ± 375 | 170.3 ± 10.3 | 3068 ± 267 |
 
-Q-learning improves only modestly from 1M to 3M decisions (1528 -> 1588
-score, 125.7 -> 129.8 pellets), which means the tabular baseline
-saturates early.  DQN has seen only one third as many environment
-interactions at 1M, so the equal-budget row is the fair sample-efficiency
-comparison; the final-budget row shows what each algorithm does with the
-budget it was given.
+Q-learning improves from 1528 to 1791 score and 125.7 to 141.2 pellets
+between 1M and 3M decisions, but its seed spread widens (seed 0 reaches
+2076, while seeds 1 and 2 sit near 1650).  DQN has seen only one third as
+many environment interactions at 1M, so the equal-budget row is the fair
+sample-efficiency comparison; the final-budget row shows what each
+algorithm does with the budget it was given.
 
 ### Learning-curve shape (important)
 
 DQN seed 0 was flat at roughly 1000-1200 score until about 450k
 decisions, then improved sharply to 1900-2500 score and 160-175 pellets
 between 500k and 950k.  Its loss fell from ~0.014 to ~0.009 over the same
-period.  Q-learning reached its plateau much earlier (around 500k-1M) and
-then oscillated.
+period.  Q-learning's evaluation curve rises quickly through 1M decisions
+and then oscillates around 1800-2100 score; its final greedy policy is
+much better than its 1M checkpoint, but it does not show DQN's sharp late
+takeoff.
 
 This is the classic sample-efficiency vs asymptotic-performance
 trade-off: the tabular agent extracts useful behaviour from far fewer
 environment steps, while the neural agent needs more data but then
-represents a much stronger policy.  A 1M-decision DQN therefore beats a
-3M-decision tabular agent by a wide margin in this game.
+represents a stronger policy.  A 1M-decision DQN beats a 3M-decision
+tabular agent on average by about 28% score, although the weakest DQN
+seed (1853) is close to the Q-learning mean (1791).
 
-Provisional DQN seed 0 at 1M: **2481 score, 173.0 pellets, 3139 survival
-frames** over 30 evaluation seeds.  Seeds 1 and 2 are running for the
-mean and standard deviation.
+Final DQN checkpoints over 30 evaluation seeds: seed 0 **2481 score /
+173.0 pellets**, seed 1 **2523 / 178.9**, seed 2 **1853 / 158.9**.  The
+mean is **2285 ± 375 score**.  The large standard deviation is driven by
+seed 2, which improved later and less smoothly than seeds 0 and 1; it is
+a real seed-variance warning, not an evaluation-seed artefact (all three
+checkpoints use the same 30 evaluation seeds).
 
-TBD: learning curves (`runs/comparison.png`), final DQN mean/std, and the
-discussion.
+The learning curves are in `runs/comparison.png`; the 3-seed final bar
+chart is `runs/seed_summary.png`.
+
+### Single-file end-to-end demo
+
+The standalone `train.py` was also run from scratch with the report
+reward (`--score-scale 0.01 --death-penalty -5`), the same DQN width and
+1M decisions.  It is a separate seed-0 trajectory because it does not run
+the mid-training evaluations that `train_dqn.py` performs.  Its final
+checkpoint scores **2359 ± 290** over 30 fixed evaluation seeds (177.5
+pellets, 3127 survival frames).  The in-script 10-episode check reported
+2383 ± 266, and the final live game scored 2330 before the third death.
+
+That run produced `runs/train_demo/training.gif`: **100,000 frames,
+224x288, 304.6 MiB**, a 30 fps training timelapse captured every tenth
+decision.  The intermediate MP4 is 120 MiB.  Both live under `runs/`,
+which is intentionally git-ignored because of their size.  The full
+end-to-end run took 4235 s while sharing the GPU with another experiment;
+most of the extra time versus the 1M training runs is frame rendering and
+the two-pass GIF encode.
 
 ## Discussion
 
@@ -121,11 +147,14 @@ efficiency.**  The exact final numbers are in the tables above, but the
 pattern is clear:
 
 - Q-learning learns a useful policy in well under a million decisions
-  and reaches roughly 1500-1600 score / 125-130 pellets.
+  and reaches 1791 score / 141 pellets after 3M decisions (1528 / 126 at
+  1M).
 - DQN is weaker for the first ~400k decisions, then improves sharply and
-  reaches roughly 2400-2500 score / 170+ pellets by 1M decisions.
+  reaches a 3-seed mean of 2285 score / 170 pellets by 1M decisions.  Its
+  seed-to-seed spread is large (1853 to 2523), so DQN's advantage is
+  reliable in the mean but not guaranteed for every seed.
 - Neither agent clears level 1 in this first study, but DQN eats about
-  70% of the pellets versus about 53% for Q-learning.
+  70% of the pellets versus about 58% for Q-learning.
 
 If the question is "which trained agent plays better?", the answer is
 DQN.  If the question is "which method gives a usable agent for the least
@@ -171,7 +200,7 @@ training run are the obvious next experiments.
 | --- | ---: | --- |
 | Q-learning, 1M decisions | ~105 s | 1 CPU core |
 | Q-learning, 3M decisions | ~320 s | 1 CPU core |
-| DQN, 1M decisions | ~1950 s | RTX 4060 + 1 CPU core |
+| DQN, 1M decisions | ~1950 s (3085 s while sharing the GPU) | RTX 4060 + 1 CPU core |
 
 The DQN is roughly 6x more expensive than the 3M Q-learning run and
 about 18x more expensive than the 1M Q-learning run.  That is the price
@@ -193,6 +222,17 @@ PY=/home/deathslash/venvs/mlasgn/bin/python
 SDL_VIDEODRIVER=dummy $PY -m rl.smoke_test
 bash rl/run_experiments.sh
 $PY -m rl.plot
+```
+
+Single-file from-scratch run with the 100,000-frame training GIF and the
+live game at the end:
+
+```bash
+$PY train.py
+# server / no display:
+$PY train.py --headless --no-watch
+# reproduce this report's reward values explicitly:
+$PY train.py --score-scale 0.01 --death-penalty -5
 ```
 
 Watch a trained agent:

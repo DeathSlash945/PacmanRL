@@ -35,6 +35,31 @@ Tested on Python 3.14 with pygame-ce. Install `pygame-ce`, not `pygame` (they co
 
 Keyboard control is a debug option. Set `HUMAN=False` in `game.py` to ignore the keyboard so an agent can drive Pac-Man instead. With `HUMAN=True`, the game restarts two seconds after game over.
 
+## Reinforcement learning
+
+The game is wrapped as a Gym-style environment in `rl/`.  The single-file
+entry point trains a DQN (or the tabular Q-learning baseline) from
+scratch, records a 100,000-frame training timelapse GIF, evaluates the
+agent, and then opens a live game that keeps playing until all three
+lives are gone:
+
+```bash
+python train.py
+# server / no display:
+python train.py --headless --no-watch
+# smaller / faster smoke test:
+python train.py --agent q --total-decisions 2000 --gif-frames 200 \
+  --eval-episodes 2 --no-watch
+```
+
+Outputs go to `runs/train_demo/`: `dqn.pt`, `episodes.csv`, `eval.json`,
+`run.json` and `training.gif`.  The GIF is streamed through ffmpeg, so
+100,000 frames do not sit in RAM.  At the native 224x288 resolution the
+full GIF is about 300 MiB; use `--gif-width 140 --gif-height 180` for a
+smaller file, or `--gif-frames 0` to skip recording.  See `REPORT.md` for
+the Q-learning vs DQN comparison and `rl/WALKTHROUGH.md` for the
+line-by-line explanation.
+
 ## Project layout
 
 | File | Purpose |
@@ -45,6 +70,8 @@ Keyboard control is a debug option. Set `HUMAN=False` in `game.py` to ignore the
 | `ghost.py` | `Ghost` class: modes, targeting, movement, house walks, drawing |
 | `levels.py` | Per-level parameter table and the `params(level)` lookup |
 | `map.py` | Maze tile map, wall outlines, pellets, wall and tunnel checks |
+| `train.py` | One-file RL training, 100k-frame GIF, evaluation and live play |
+| `rl/` | Environment wrapper, observations, Q-learning, DQN, evaluation and tools |
 
 ## Specs
 

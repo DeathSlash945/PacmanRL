@@ -79,7 +79,9 @@ def main():
     for ax, (name, title) in zip(axes.flat, METRICS):
         for label, rows in runs.items():
             x, mean, std = metric_values(rows, name)
-            color = COLORS["q"] if "Q" in label else COLORS["dqn"]
+            # "DQN" also contains the letter Q, so match the first letter
+            # instead of searching anywhere in the label.
+            color = COLORS["q"] if label.startswith("Q") else COLORS["dqn"]
             ax.plot(x, mean, label=label, color=color, linewidth=2)
             ax.fill_between(x, mean - std, mean + std, color=color, alpha=0.18)
         if random_summary is not None:
@@ -103,8 +105,8 @@ def main():
     labels = list(runs)
     for ax, (name, title) in zip(axes2, final_metrics):
         values = [runs[label][-1][f"{name}_mean"] for label in labels]
-        ax.bar(labels, values, color=[COLORS["q"] if "Q" in l else COLORS["dqn"]
-                                      for l in labels])
+        ax.bar(labels, values, color=[COLORS["q"] if l.startswith("Q")
+                                      else COLORS["dqn"] for l in labels])
         ax.set_title(title)
         ax.grid(axis="y", alpha=0.3)
     fig2.tight_layout()
