@@ -21,7 +21,9 @@ The original game files (`env.py`, `pacman.py`, `ghost.py`, `map.py`,
 | `train_dqn.py` | DQN training loop |
 | `eval_agent.py` | evaluate a saved checkpoint |
 | `plot.py` | learning-curve comparison plots |
+| `aggregate.py` | multi-seed mean/std table and bar chart |
 | `watch.py` | watch a trained agent in pygame |
+| `record.py` | record a trained agent to an animated GIF |
 
 ## Observation
 
@@ -158,10 +160,16 @@ SDL_VIDEODRIVER=dummy $PY -m rl.eval_agent --agent dqn \
 
 # plots
 $PY -m rl.plot --q runs/qlearning/metrics.csv --dqn runs/dqn/metrics.csv
+$PY -m rl.aggregate
 
 # watch (needs a display)
 $PY -m rl.watch --agent q --checkpoint runs/qlearning/q.pkl
 $PY -m rl.watch --agent dqn --checkpoint runs/dqn/dqn.pt --width 32
+
+# record a GIF (no display needed)
+SDL_VIDEODRIVER=dummy $PY -m rl.record --agent dqn \
+    --checkpoint runs/dqn_seed0/dqn.pt --width 32 \
+    --frames 1800 --out runs/dqn_demo.gif
 ```
 
 ## Metrics
@@ -173,7 +181,20 @@ skip, episode limit and evaluation seeds for both algorithms.
 
 ## Results
 
-Filled in after the final runs (see the project report).
+### 30-episode greedy evaluation, 3 training seeds
+
+| Agent | Score | Pellets | Survival (frames) |
+| --- | ---: | ---: | ---: |
+| Random | 342 ± 0 | 34.2 ± 0 | 2057 ± 0 |
+| Q-learning, 1M | 1528 ± 101 | 125.7 ± 12.1 | 3437 ± 277 |
+| Q-learning, 3M | 1588 ± 105 | 129.8 ± 13.4 | 3690 ± 663 |
+| DQN, 1M | TBD | TBD | TBD |
+
+DQN seed 0 at 1M: 2481 score, 173.0 pellets, 3139 frames.  Seeds 1 and
+2 are running; the final mean/std will replace the TBD row.
+
+DQN is weaker for the first ~400k decisions, then improves sharply and
+overtakes both Q-learning runs.  The full analysis is in `REPORT.md`.
 
 ## Known limitations
 
