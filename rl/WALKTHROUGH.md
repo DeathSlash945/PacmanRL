@@ -636,6 +636,34 @@ deaths = 3 - info["lives"]
 Evaluation uses fixed seeds `10000 + i`.  Both algorithms see exactly the
 same ghost randomness, which makes the comparison paired and fair.
 
+### How to read the CSV logs
+
+`runs/<experiment>/metrics.csv` has one row per evaluation:
+
+| Column | Meaning |
+| --- | --- |
+| `decision` | training decisions seen so far |
+| `episode` | training episodes completed so far |
+| `epsilon` | exploration rate at that moment |
+| `updates` | DQN gradient steps (Q-learning leaves this empty) |
+| `loss_mean` | mean DQN Huber loss during the last episode |
+| `return_mean/std` | greedy evaluation return |
+| `score_mean/std` | greedy evaluation game score |
+| `dots_mean/std` | pellets eaten per episode |
+| `frames_mean/std` | survival time in game frames |
+| `deaths_mean/std` | deaths per episode (normally 3) |
+| `clears_mean/std` | levels cleared per episode |
+| `wall_seconds` | real training time when the evaluation ran |
+
+`runs/<experiment>/episodes.csv` has one row per *training* episode.
+That is the noisy exploration data; `metrics.csv` is the clean greedy
+evaluation.  Always compare algorithms on `metrics.csv`, not on the
+training episode returns.
+
+`runs/eval_*.json` contains the final 30-episode evaluation, including
+the per-episode rows.  `runs/seed_summary.json` aggregates those across
+training seeds and is what the report's final table uses.
+
 ---
 
 ## 8. Plotting and viewing

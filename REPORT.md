@@ -8,9 +8,9 @@ Deep Q-Network agent, and compare them on identical evaluation seeds.
 
 | Agent | Eval score | Pellets eaten | Survival (frames) | Deaths | Level clears |
 | --- | ---: | ---: | ---: | ---: | ---: |
-| Random | TBD | TBD | TBD | TBD | TBD |
-| Q-learning (3M decisions) | TBD | TBD | TBD | TBD | TBD |
-| DQN (1M decisions) | TBD | TBD | TBD | TBD | TBD |
+| Random | 342 ± 0 | 34.2 ± 0 | 2057 ± 0 | 3.0 | 0 |
+| Q-learning (3M decisions, 3 seeds) | 1588 ± 105 | 129.8 ± 13.4 | 3690 ± 663 | 3.0 | 0 |
+| DQN (1M decisions, 3 seeds) | TBD | TBD | TBD | TBD | TBD |
 
 (Mean over 30 fixed evaluation seeds. Full numbers and standard
 deviations are in the results section below.)
