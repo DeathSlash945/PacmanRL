@@ -1,9 +1,9 @@
-"""Record a trained agent to a GIF (no display needed).
+"""Record a trained DQN agent to a GIF (no display needed).
 
 Example:
     SDL_VIDEODRIVER=dummy /home/deathslash/venvs/mlasgn/bin/python \
-        -m rl.record --agent dqn --checkpoint runs/dqn_seed0/dqn.pt \
-        --frames 900 --out runs/dqn_demo.gif
+        -m rl.record --agent dqn --checkpoint runs/dqn/best.pt \
+        --frames 1800 --out runs/dqn_demo.gif
 
 Frames are rendered with the same drawing functions as the game, then
 downscaled to the native 224x288 resolution and packed into an animated
@@ -22,14 +22,13 @@ from PIL import Image
 
 import map as maze
 from .agents.dqn import DQNAgent
-from .agents.qlearning import QLearningAgent
 from .config import EnvConfig
 from .pacman_env import PacmanEnv
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--agent", choices=("q", "dqn", "random"), required=True)
+    p.add_argument("--agent", choices=("dqn", "random"), required=True)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--frames", type=int, default=900)
@@ -37,7 +36,9 @@ def parse_args():
     p.add_argument("--every", type=int, default=2,
                    help="save every Nth game frame")
     p.add_argument("--fps", type=int, default=30)
-    p.add_argument("--width", type=int, default=32)
+    p.add_argument("--level-cap", type=int, default=1,
+                   help="stop after this level; 0 records the full game")
+    p.add_argument("--width", type=int, default=64)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--out", type=str, default="runs/demo.gif")
     return p.parse_args()
@@ -66,17 +67,13 @@ def main():
     screen = pg.display.set_mode((224 * maze.winScale, 288 * maze.winScale))
     font = pg.font.SysFont("consolas", 20, bold=True)
 
+    level_cap = args.level_cap if args.level_cap > 0 else None
     env = PacmanEnv(EnvConfig(frame_skip=1, max_frames=10**9,
-                              level_cap=1, seed=args.seed))
+                              level_cap=level_cap, seed=args.seed))
 
     if args.agent == "random":
         rng = random.Random(args.seed)
         policy = lambda _obs: rng.randrange(4)
-    elif args.agent == "q":
-        if not args.checkpoint:
-            raise SystemExit("--checkpoint is required for --agent q")
-        agent = QLearningAgent.load(args.checkpoint)
-        policy = lambda _obs: agent.act(agent.state_from_game(env.game), greedy=True)
     else:
         if not args.checkpoint:
             raise SystemExit("--checkpoint is required for --agent dqn")

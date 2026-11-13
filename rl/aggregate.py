@@ -1,10 +1,11 @@
-"""Aggregate the 30-episode evaluation JSONs across training seeds.
+"""Aggregate the 30-episode DQN evaluation JSONs across training seeds.
 
     python -m rl.aggregate
 
-Reads runs/eval_q_seed*.json, runs/eval_dqn_seed*.json and
-runs/eval_random.json, prints a markdown table, and saves a bar chart
-with error bars (mean +/- std across training seeds).
+Reads runs/eval_dqn_seed*.json and runs/eval_random.json, prints a markdown
+table, and saves a bar chart with error bars (mean +/- std across training
+seeds).  Q-learning was removed from the final system; the only comparison
+here is DQN versus the random-action baseline.
 """
 
 import glob
@@ -42,7 +43,6 @@ def group_stats(runs):
 
 def main():
     groups = {
-        "Q-learning": load_group("runs/eval_q_seed*.json"),
         "DQN": load_group("runs/eval_dqn_seed*.json"),
         "Random": load_group("runs/eval_random.json"),
     }
@@ -75,9 +75,7 @@ def main():
     for ax, metric in zip(axes, ("score", "dots", "frames", "deaths")):
         values = [summary[name][metric]["mean"] for name in names]
         errors = [summary[name][metric]["std"] for name in names]
-        ax.bar(names, values, yerr=errors, capsize=6,
-               color=["tab:blue" if n.startswith("Q") else "tab:orange"
-                      for n in names])
+        ax.bar(names, values, yerr=errors, capsize=6, color="tab:orange")
         ax.set_title(metric)
         ax.grid(axis="y", alpha=0.3)
     fig.suptitle("Final greedy evaluation (mean +/- std across training seeds)")

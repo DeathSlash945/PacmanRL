@@ -1,8 +1,7 @@
-"""Watch a trained agent play in a real pygame window.
+"""Watch a trained DQN agent play in a real pygame window.
 
 Examples:
-    python -m rl.watch --agent q   --checkpoint runs/qlearning/q.pkl
-    python -m rl.watch --agent dqn --checkpoint runs/dqn/dqn.pt --width 32
+    python -m rl.watch --agent dqn --checkpoint runs/dqn/best.pt
     python -m rl.watch --agent random
 
 The viewer runs the game at 60 FPS and asks the agent for a new action
@@ -18,20 +17,21 @@ import pygame as pg
 
 import map as maze
 from .agents.dqn import DQNAgent
-from .agents.qlearning import QLearningAgent
 from .config import EnvConfig
 from .pacman_env import PacmanEnv
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--agent", choices=("q", "dqn", "random"), required=True)
+    p.add_argument("--agent", choices=("dqn", "random"), required=True)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--episodes", type=int, default=3)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--fps", type=int, default=60)
     p.add_argument("--decide-every", type=int, default=4)
-    p.add_argument("--width", type=int, default=32)
+    p.add_argument("--level-cap", type=int, default=1,
+                   help="stop after this level; 0 plays the full game")
+    p.add_argument("--width", type=int, default=64)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--max-frames", type=int, default=0,
                    help="stop after N frames (useful for headless smoke tests)")
@@ -59,22 +59,18 @@ def draw(screen, game, frame, font):
 def main():
     args = parse_args()
     pg.init()
-    pg.display.set_caption("PacmanRL - trained agent")
+    pg.display.set_caption("PacmanRL - trained DQN")
     screen = pg.display.set_mode((224 * maze.winScale, 288 * maze.winScale))
     clock = pg.time.Clock()
     font = pg.font.SysFont("consolas", 20, bold=True)
 
+    level_cap = args.level_cap if args.level_cap > 0 else None
     env = PacmanEnv(EnvConfig(frame_skip=1, max_frames=10**9,
-                              level_cap=1, seed=args.seed))
+                              level_cap=level_cap, seed=args.seed))
 
     if args.agent == "random":
         rng = random.Random(args.seed)
         policy = lambda _obs: rng.randrange(4)
-    elif args.agent == "q":
-        if not args.checkpoint:
-            raise SystemExit("--checkpoint is required for --agent q")
-        agent = QLearningAgent.load(args.checkpoint)
-        policy = lambda _obs: agent.act(agent.state_from_game(env.game), greedy=True)
     else:
         if not args.checkpoint:
             raise SystemExit("--checkpoint is required for --agent dqn")

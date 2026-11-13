@@ -4,12 +4,15 @@ The observation grid contains only these values: 0, 0.5, -1 and 1.
 Multiplying by 2 and storing int8 keeps each frame at 8*31*28 = 6944
 bytes instead of 27 KB as float32.  A 100k-transition buffer therefore
 uses about 1.4 GB of RAM instead of 5.6 GB.
+
+The 16 ghost-direction bits are stored as int8 as well.  They add only
+1.6 MB to a 100k buffer, so we keep them even for agents that ignore them.
 """
 
 import numpy as np
 import torch
 
-from .config import GRID_H, GRID_W, N_CHANNELS, VEC_DIM
+from .config import GHOST_DIR_DIM, GRID_H, GRID_W, N_CHANNELS, VEC_DIM
 
 
 def encode_grid(grid):
@@ -24,6 +27,8 @@ class ReplayBuffer:
         self.next_grid = np.zeros_like(self.grid)
         self.vec = np.zeros((capacity, VEC_DIM), dtype=np.float32)
         self.next_vec = np.zeros_like(self.vec)
+        self.ghost_dir = np.zeros((capacity, GHOST_DIR_DIM), dtype=np.int8)
+        self.next_ghost_dir = np.zeros_like(self.ghost_dir)
         self.action = np.zeros(capacity, dtype=np.int64)
         self.reward = np.zeros(capacity, dtype=np.float32)
         self.terminal = np.zeros(capacity, dtype=np.uint8)
@@ -36,10 +41,16 @@ class ReplayBuffer:
         i = self.pos
         self.grid[i] = encode_grid(obs["grid"])
         self.vec[i] = obs["vec"]
+        self.ghost_dir[i] = obs.get(
+            "ghost_dir", np.zeros(GHOST_DIR_DIM, dtype=np.float32)
+        )
         self.action[i] = action
         self.reward[i] = reward
         self.next_grid[i] = encode_grid(next_obs["grid"])
         self.next_vec[i] = next_obs["vec"]
+        self.next_ghost_dir[i] = next_obs.get(
+            "ghost_dir", np.zeros(GHOST_DIR_DIM, dtype=np.float32)
+        )
         self.terminal[i] = float(terminal)
 
         self.pos = (self.pos + 1) % self.capacity
@@ -53,9 +64,11 @@ class ReplayBuffer:
         return {
             "grid": torch.from_numpy(self.grid[idx]),
             "vec": torch.from_numpy(self.vec[idx]),
+            "ghost_dir": torch.from_numpy(self.ghost_dir[idx]),
             "action": torch.from_numpy(self.action[idx]),
             "reward": torch.from_numpy(self.reward[idx]),
             "next_grid": torch.from_numpy(self.next_grid[idx]),
             "next_vec": torch.from_numpy(self.next_vec[idx]),
+            "next_ghost_dir": torch.from_numpy(self.next_ghost_dir[idx]),
             "terminal": torch.from_numpy(self.terminal[idx]).float(),
         }

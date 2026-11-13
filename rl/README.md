@@ -5,49 +5,59 @@ The original game files (`env.py`, `pacman.py`, `ghost.py`, `map.py`,
 `rl/` package that reads the live game state and drives Pac-Man through
 `pacman.set_dir()` and `game.update()`.
 
+## Algorithm note
+
+The final system uses **DQN only**.  Q-learning was tried and discarded:
+
+- its hand-designed local state cannot see the full maze or all ghosts;
+- a Python-dict Q-table scales poorly to millions of states;
+- it scored lower than DQN in the earlier experiments, despite being
+  much cheaper to train.
+
+See `../REPORT.md` for the full explanation.  The Q-learning code and
+command-line branches have been removed so there is one working path.
+
 ## Files
 
 | File | Purpose |
 | --- | --- |
 | `config.py` | actions, observation sizes, reward and episode settings |
-| `obs.py` | turns a live `Game` into an 8x31x28 grid + 18-vector |
-| `pacman_env.py` | Gym-style `reset()` / `step()` wrapper |
+| `obs.py` | turns a live `Game` into an 8x31x28 grid + 18-vector + 16 ghost-direction bits |
+| `pacman_env.py` | Gym-style `reset()` / `step()` wrapper; stay/no-dot/danger rewards and endgame dots |
 | `evaluate.py` | fixed-seed episode runner and metrics |
-| `agents/qlearning.py` | tabular Q-learning with a compact state |
-| `agents/dqn.py` | DQN: replay, target network, Double DQN |
-| `networks.py` | CNN + scalar-vector Q-network |
+| `agents/dqn.py` | Double DQN with replay and target network |
+| `networks.py` | convolutional dueling Q-network |
 | `buffer.py` | int8 replay buffer |
-| `train_q.py` | Q-learning training loop |
-| `train_dqn.py` | DQN training loop |
+| `train_dqn.py` | low-level DQN training loop with CSV logs |
 | `eval_agent.py` | evaluate a saved checkpoint |
-| `plot.py` | learning-curve comparison plots |
+| `report.py` | build `metrics.csv`, `stats.json`, `summary.md` and the showcase |
+| `plot.py` | single-page six-panel training/evaluation showcase |
 | `aggregate.py` | multi-seed mean/std table and bar chart |
 | `watch.py` | watch a trained agent in pygame |
 | `record.py` | record a trained agent to an animated GIF |
+| `smoke_test.py` | shapes, determinism, reward, stay/no-dot penalties, benchmark |
+| `run_experiments.sh` | three-seed DQN sweep + final evaluations |
 
 The single-file entry point is one directory up:
 
 | File | Purpose |
 | --- | --- |
-| `../train.py` | from-scratch DQN/Q-learning training, 100k-frame training GIF, checkpoint, fixed-seed evaluation, then a live game until death |
+| `../train.py` | from-scratch DQN training, generations/curriculum, 100k-frame GIF, checkpoint selection, fixed-seed evaluation, then a live game until death |
 
 Run it from the project root:
 
 ```bash
+PY=/home/deathslash/venvs/mlasgn/bin/python
+
 # DQN, 1M decisions, 100,000-frame training GIF, live game at the end
-/home/deathslash/venvs/mlasgn/bin/python train.py
+$PY train.py
 
 # No display / server: still trains, records and evaluates, no window
-/home/deathslash/venvs/mlasgn/bin/python train.py --headless --no-watch
+$PY train.py --headless --no-watch
 
-# Fast smoke test
-/home/deathslash/venvs/mlasgn/bin/python train.py --agent q \
-  --total-decisions 2000 --gif-frames 200 --eval-episodes 2 --no-watch
-
-# Reproduce the reward values used in REPORT.md, even if rl/config.py
-# has since been tuned
-/home/deathslash/venvs/mlasgn/bin/python train.py \
-  --score-scale 0.01 --death-penalty -5
+# Fast smoke test (not a useful policy)
+$PY train.py --total-decisions 2000 --generations 2 --curriculum \
+  --gif-frames 0 --eval-episodes 2 --no-watch
 ```
 
 The GIF is a training timelapse: with the defaults it captures one frame
@@ -59,7 +69,8 @@ a 100,000-frame clip.  The native 224x288 GIF is about 300 MiB; use
 
 ## Observation
 
-`obs = {"grid": float32[8,31,28], "vec": float32[18]}`.
+`obs = {"grid": float32[8,31,28], "vec": float32[18],
+"ghost_dir": float32[16]}`.
 
 Grid channels:
 
@@ -83,6 +94,13 @@ lives, level, moving flag, and counts of dangerous/frightened/harmless
 ghosts.  This gives the network the timers and mode information that a
 spatial grid cannot express.
 
+`ghost_dir` is four one-hot directions for each ghost, in the fixed order
+Blinky, Pinky, Inky, Clyde.  Position alone cannot tell the network whether
+a ghost is about to enter Pac-Man's corridor; direction can.  New agents
+use this branch by default.  Old checkpoints load without it, and
+`--partial-load` transfers the old weights into the new architecture while
+zeroing the new input columns so the starting policy is unchanged.
+
 ## Actions and time
 
 Four actions: `up`, `left`, `down`, `right`.  The action is a *requested*
@@ -96,20 +114,50 @@ environment fast without giving the agent super-human reaction speed.
 
 ## Reward
 
+Defaults in `config.RewardConfig`:
+
 | Event | Reward |
 | --- | --- |
-| dot | `+10 * 0.01 = +0.1` |
-| power pellet | `+50 * 0.01 = +0.5` |
-| ghost | `+200/400/800/1600 * 0.01` |
-| fruit | score value `* 0.01` |
-| death | `-5` |
-| level clear | `+10` |
-| per decision | `0` (available for tuning) |
+| dot | `+10 * 0.02 = +0.2` |
+| power pellet | `+50 * 0.02 = +1.0` |
+| ghost | `+200/400/800/1600 * 0.02 * ghost_score_scale` (`scale=0.5` by default) |
+| fruit | score value `* 0.02` |
+| death | `-15` |
+| level clear | `+20` |
+| stays still for one decision | `-0.02` |
+| no dot for 45 decisions | `-0.02` per decision until the next dot |
+| near a dangerous ghost | up to `-0.02` per decision within 5 tiles |
+| per decision | `-0.001` (`step_penalty`) |
 
 The game never subtracts score on death, so the death penalty is added
-explicitly.  `score_scale`, `death_penalty`, `step_penalty` and
-`level_clear_bonus` live in `config.RewardConfig` and can be changed
-without touching the game.
+explicitly.  The stay penalty is separate from the step penalty: it fires
+only when Pac-Man's position is unchanged over the whole decision, so it
+stops corner-camping without punishing normal movement or a legitimate
+pellet pause.
+
+The no-dot penalty is separate progress pressure.  It starts after
+`dot_not_eaten_grace=45` decisions without a pellet (3 seconds at the
+default frame skip) and then charges `dot_not_eaten_penalty=-0.02` per
+decision until the next dot.  It is not charged on terminal frames and
+resets when a dot or power pellet is eaten.  This stops the agent from
+surviving forever in an already-cleared corridor instead of finishing the
+remaining pellets.
+
+`ghost_score_scale` changes only the 200/400/800/1600 ghost-combo points,
+not dots, power pellets or fruit.  It exists because a single power pellet
+can otherwise be worth +60 reward, four times a death, which teaches the
+agent to farm ghost chains instead of running away.
+
+`danger_penalty`/`danger_radius` add a small per-decision cost when a
+scatter/chase ghost is within the radius.  The cost is scaled linearly by
+closeness and skipped on terminal frames.  It is a shaping signal, not a
+replacement for the death penalty.
+
+`dots_removed_min/max` implement the endgame curriculum.  Each training
+episode can start with a random number of ordinary dots already removed;
+power pellets are kept.  Evaluation always sets both to zero.  `info`
+includes `dots_removed`, `dots_eaten`, `ghost_score`, `danger` and
+`danger_penalty` so the new signals can be audited.
 
 ## Episodes
 
@@ -122,48 +170,83 @@ Some subtleties of this game matter for a correct wrapper:
   respawns Pac-Man.  The wrapper therefore detects death by
   `pacman.lives` decreasing.
 - After a death the game resets Pac-Man's direction to `left`, so the
-  wrapper stops the current `frame_skip` immediately.  Otherwise the
-  remaining skipped frames would use a stale action.
+  wrapper stops the current `frame_skip` immediately.
 - `level_cap=1` ends the episode when level 1 is cleared; `level_cap=None`
   lets training continue into later levels.
 - `max_frames` is an episode time limit (default 18,000 frames = 5
   minutes of game time).  This is a truncation, not a terminal state, and
   DQN still bootstraps from the last observation.
 
-## Q-learning baseline
-
-A full tabular Q-table is impossible: 244 pellets give `2**244` maze
-configurations.  The baseline compresses the game to:
-
-```
-(col, row, 4-neighbour pellet bits, nearest-ghost sector,
- nearest-ghost distance bucket, fright bucket, current direction)
-```
-
-That is still millions of possible states, so the Q-table is a Python
-dict and rows are allocated only for visited states.  Update:
-
-```
-Q(s,a) <- Q(s,a) + alpha * (r + gamma * max_a' Q(s',a') - Q(s,a))
-```
-
-with `alpha=0.1`, `gamma=0.99`, epsilon decayed linearly from 1.0 to
-0.05 over 200k decisions.  This is a fair "classic RL" baseline, not a
-hand-coded pellet chaser.
-
 ## DQN
 
-- Input: the grid + vector above.
-- Network: 3 convolutions (32, 64, 64 channels, two stride-2 layers),
-  concatenated with the 18-vector, then 512 hidden units and 4 Q-values.
-- Replay buffer: 100k transitions, observations stored as int8 and
-  converted to float on the GPU.
+- Input: the grid + vector + optional ghost-direction vector above.
+- Network: 3 convolutions (32, `width`, `width`; two stride-2 layers),
+  concatenated with the 18-vector (and the 64-unit ghost-direction branch
+  when enabled), then a 512-unit trunk and a **dueling** head (state value
+  + action advantages).
+- Replay buffer: 100k transitions by default, observations stored as int8
+  and converted to float on the GPU.  Ghost-direction bits add only 1.6 MB
+  per 100k transitions.
 - Double DQN: the online net selects the next action, the target net
   evaluates it.
 - Target network copied every 2,000 gradient steps.
 - Huber loss, Adam (`lr=1e-4`), gradient clipping at 10.
-- Epsilon-greedy: 1.0 -> 0.05 over 200k decisions.
-- One gradient step every 2 decisions by default (`--train-every 2`).
+- Epsilon-greedy: 1.0 -> 0.02 over 500k decisions by default.
+- One gradient step every 2 decisions by default; use `--train-every 1`
+  for the strongest long run.
+
+## Generations and curriculum
+
+`train.py` can split a long run into generations without resetting the
+network or replay buffer:
+
+```bash
+$PY train.py --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
+  --generations 10 --total-decisions 20000000 \
+  --curriculum --curriculum-max-level 4 --max-frames 60000 \
+  --width 64 --train-every 1 --gamma 0.997 --batch-size 128 \
+  --replay-size 150000 --epsilon-decay 3000000 --epsilon-end 0.01 \
+  --reset-epsilon --lr-final 5e-6 --eval-episodes 30 \
+  --eval-level-cap 0 --ghost-score-scale 0.35 --danger-penalty 0.03 \
+  --danger-radius 5 --death-penalty -20 --level-clear-bonus 30 \
+  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
+  --dot-not-eaten-grace 30 --dots-removed-min 0 --dots-removed-max 160 \
+  --gif-frames 100000 --out runs/train_dqn_final
+```
+
+- `--curriculum` makes generation 1 cap at level 1, generation 2 at level
+  2, and so on.  After `--curriculum-max-level`, later generations have no
+  level cap.
+- `--dots-removed-min/max` gives the agent endgame transitions without
+  throwing away full-level experience; the range is sampled per episode.
+- `--partial-load` transfers a checkpoint from the old observation
+  architecture.  The new ghost-direction columns start at zero, so the
+  resumed policy is exactly preserved before training changes it.
+- A resumed checkpoint is evaluated first as generation 0.  `best.pt` is
+  only replaced if a later generation beats it on
+  `(clears, pellets, score)`.
+- After each generation, `eval_genN.json` is written and the agent is
+  saved as `dqn_genN.pt`.
+- `best.pt` is selected by `(clears, pellets, score)` on the fixed
+  evaluation seeds.  Evaluation always disables the endgame dot removal and
+  uses the full maze.  The final live game uses `best.pt` unless
+  `--no-best` is passed.
+- `--resume` continues from `<out>/dqn.pt` and skips warmup.  `train.py`
+  reads `progress.json` (or `run.json` for older runs) and starts at the
+  next unfinished generation automatically; `--start-generation G`
+  overrides that when you deliberately want to repeat a generation.  For
+  example, `--resume --generations 10 --start-generation 5` continues a
+  curriculum at level cap 5.
+- `--resume-from PATH` loads an explicit checkpoint.  Combined with a new
+  `--out` directory it preserves the original run's logs and GIF while the
+  continuation writes its own report.
+- `--reset-epsilon` restarts epsilon decay at 1.0 on resume, which gives
+  the agent a fresh exploration phase.  Without it, the checkpoint's low
+  epsilon is kept.
+- At the end of every run `train.py` writes `metrics.csv`, `stats.json`,
+  `summary.md` and `training_showcase.png`.  Existing runs can be rebuilt
+  with `python -m rl.report --run <directory>`; the same command also works
+  on a live run before `run.json` exists.
 
 ## Commands
 
@@ -175,32 +258,28 @@ PY=/home/deathslash/venvs/mlasgn/bin/python
 # verification
 SDL_VIDEODRIVER=dummy $PY -m rl.smoke_test
 
-# Q-learning
-SDL_VIDEODRIVER=dummy $PY -m rl.train_q \
-    --total-decisions 1000000 --eval-every 100000 --out runs/qlearning
-
-# DQN
+# low-level DQN trainer (CSV logs every eval)
 SDL_VIDEODRIVER=dummy $PY -m rl.train_dqn \
-    --total-decisions 1000000 --width 32 --train-every 2 \
+    --total-decisions 1000000 --width 64 --train-every 2 \
     --eval-every 50000 --out runs/dqn
 
-# evaluate on 30 fixed seeds
-SDL_VIDEODRIVER=dummy $PY -m rl.eval_agent --agent q \
-    --checkpoint runs/qlearning/q.pkl --episodes 30
-SDL_VIDEODRIVER=dummy $PY -m rl.eval_agent --agent dqn \
-    --checkpoint runs/dqn/dqn.pt --width 32 --episodes 30
+# evaluate on 30 fixed seeds; level-cap 0 = full game
+SDL_VIDEODRIVER=dummy $PY -m rl.eval_agent --agent dqn --width 64 \
+    --level-cap 0 --checkpoint runs/dqn/best.pt --episodes 30
 
-# plots
-$PY -m rl.plot --q runs/qlearning/metrics.csv --dqn runs/dqn/metrics.csv
+# plots and summary for a finished train.py run
+$PY -m rl.report --run runs/train_dqn
+
+# single-page six-panel showcase
+$PY -m rl.plot --run runs/dqn
 $PY -m rl.aggregate
 
 # watch (needs a display)
-$PY -m rl.watch --agent q --checkpoint runs/qlearning/q.pkl
-$PY -m rl.watch --agent dqn --checkpoint runs/dqn/dqn.pt --width 32
+$PY -m rl.watch --agent dqn --checkpoint runs/dqn/best.pt --level-cap 0
 
 # record a GIF (no display needed)
 SDL_VIDEODRIVER=dummy $PY -m rl.record --agent dqn \
-    --checkpoint runs/dqn_seed0/dqn.pt --width 32 \
+    --checkpoint runs/dqn/best.pt --level-cap 0 \
     --frames 1800 --out runs/dqn_demo.gif
 ```
 
@@ -208,34 +287,14 @@ SDL_VIDEODRIVER=dummy $PY -m rl.record --agent dqn \
 
 Evaluation is greedy (no epsilon) on seeds `10000..10000+N-1`.  Reported
 per episode: return, score, pellets eaten, survival frames, deaths, and
-levels cleared.  The comparison uses the same reward, actions, frame
-skip, episode limit and evaluation seeds for both algorithms.
-
-## Results
-
-### 30-episode greedy evaluation, 3 training seeds
-
-| Agent | Score | Pellets | Survival (frames) |
-| --- | ---: | ---: | ---: |
-| Random | 342 ± 0 | 34.2 ± 0 | 2057 ± 0 |
-| Q-learning, 1M | 1528 ± 101 | 125.7 ± 12.1 | 3437 ± 277 |
-| Q-learning, 3M | 1588 ± 105 | 129.8 ± 13.4 | 3690 ± 663 |
-| DQN, 1M | TBD | TBD | TBD |
-
-DQN seed 0 at 1M: 2481 score, 173.0 pellets, 3139 frames.  Seeds 1 and
-2 are running; the final mean/std will replace the TBD row.
-
-DQN is weaker for the first ~400k decisions, then improves sharply and
-overtakes both Q-learning runs.  The full analysis is in `REPORT.md`.
+levels cleared.  The same reward, actions, frame skip, episode limit and
+evaluation seeds are used everywhere.
 
 ## Known limitations
 
-- The Q-learning state is a hand-designed compression; it cannot see
-  the full maze, so its ceiling is lower than DQN's.
 - DQN sees the full static maze, which makes level-specific overfitting
-  easy.  Generalising across levels would need an egocentric crop or a
-  recurrent policy.
-- Only level 1 is trained initially.  `level_cap=None` enables later
-  levels, but the first version does not use a curriculum.
-- No prioritised replay, dueling heads, n-step returns or distributional
-  RL yet; those are the natural next upgrades if DQN plateaus.
+  easy; the curriculum is the first defence against that.
+- Only level 1 is trained in the default 1M run.
+- Clearing the game consistently is still the hard research problem; a
+  longer run and the curriculum improve the odds but do not guarantee it.
+- No prioritised replay, n-step returns or distributional RL yet.

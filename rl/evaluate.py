@@ -19,7 +19,13 @@ def run_episode(env, act_fn, seed):
         total_return += reward
 
     levels_cleared = info["level"] - 1
-    dots_eaten = levels_cleared * N_PELLETS + (N_PELLETS - info["dots_left"])
+    # info["dots_eaten"] is the true cumulative number and is correct even
+    # when an endgame-curriculum episode started with pre-removed dots.
+    # The fallback keeps old callers/records working.
+    dots_eaten = info.get(
+        "dots_eaten",
+        levels_cleared * N_PELLETS + (N_PELLETS - info["dots_left"]),
+    )
     deaths = 3 - info["lives"]
 
     return {

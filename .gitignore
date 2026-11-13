@@ -4,3 +4,4 @@ __pycache__/
 *.pyc
 runs/
 rl/__pycache__/
+division_of_work.txt

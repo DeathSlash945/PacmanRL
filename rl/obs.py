@@ -1,6 +1,7 @@
 """Turn a live Game object into a fixed-size observation.
 
-Observation = a (8, 31, 28) float grid plus a (18,) float vector.
+Observation = a (8, 31, 28) float grid, a (18,) float vector, and a
+(16,) ghost-direction vector.
 
 Grid channels
 -------------
@@ -24,12 +25,26 @@ The vector carries things a spatial grid cannot express well: current
 and buffered direction, frightened timer, scatter/chase phase, pellets
 left, Cruise Elroy stage, lives, level, and how many ghosts are in each
 state.
+
+The ghost-direction vector is four one-hot directions per ghost:
+[Blinky up/left/down/right, Pinky ..., Inky ..., Clyde ...].  A single
+frame shows where a ghost *is*; the direction tells the network where it
+is about to go, which is the missing piece for learning to run away.
 """
 
 import numpy as np
 
 import map as maze
-from .config import ACTIONS, GRID_H, GRID_W, N_CHANNELS, N_PELLETS, VEC_DIM
+from .config import (
+    ACTIONS,
+    GHOST_DIR_DIM,
+    GRID_H,
+    GRID_W,
+    N_CHANNELS,
+    N_GHOSTS,
+    N_PELLETS,
+    VEC_DIM,
+)
 
 CH_WALL = 0
 CH_DOT = 1
@@ -101,11 +116,18 @@ class ObservationBuilder:
         pc, pr = wrap_tile(game.pacman.tile)
         grid[CH_PAC, pr, pc] = 1.0
 
+        ghost_dir = np.zeros((N_GHOSTS, 4), dtype=np.float32)
         for i, ghost in enumerate(game.ghosts):
             gc, gr = wrap_tile(ghost.tile)
             grid[CH_GHOST0 + i, gr, gc] = GHOST_VALUE[ghost.mode]
+            if ghost.dir in ACTIONS:
+                ghost_dir[i, ACTIONS.index(ghost.dir)] = 1.0
 
-        return {"grid": grid, "vec": self._vector(game)}
+        return {
+            "grid": grid,
+            "vec": self._vector(game),
+            "ghost_dir": ghost_dir.reshape(GHOST_DIR_DIM),
+        }
 
     def _vector(self, game):
         pac = game.pacman

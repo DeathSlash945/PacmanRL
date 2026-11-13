@@ -13,17 +13,20 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import numpy as np
 
 import map as maze
-from .config import EnvConfig, RewardConfig
+from .config import GHOST_DIR_DIM, EnvConfig, RewardConfig
 from .pacman_env import PacmanEnv
 
 
 def check_observation(obs):
-    grid, vec = obs["grid"], obs["vec"]
+    grid, vec, ghost_dir = obs["grid"], obs["vec"], obs["ghost_dir"]
     assert grid.shape == (8, 31, 28), grid.shape
     assert grid.dtype == np.float32, grid.dtype
     assert vec.shape == (18,), vec.shape
     assert vec.dtype == np.float32, vec.dtype
+    assert ghost_dir.shape == (GHOST_DIR_DIM,), ghost_dir.shape
+    assert ghost_dir.dtype == np.float32, ghost_dir.dtype
     assert np.isfinite(grid).all() and np.isfinite(vec).all()
+    assert np.isfinite(ghost_dir).all()
 
 
 def test_shapes_and_reset():
@@ -80,7 +83,11 @@ def test_level_clear():
     obs, reward, done, info = env.step(0)
     assert done and info["level_cleared"], info
     assert env.game.level == 2, env.game.level
-    assert reward >= cfg.reward.level_clear_bonus, reward
+    assert reward >= (
+        cfg.reward.level_clear_bonus
+        + cfg.reward.step_penalty
+        - 1e-9
+    ), reward
     assert len(maze.pellets) == 244, "next_level must refill the maze"
     print(f"ok  level clear (reward={reward:.2f})")
 
@@ -114,6 +121,130 @@ def test_reward_signs():
             break
     assert positive, "eating at least one pellet should give positive reward"
     print("ok  reward signs")
+
+
+def test_stay_penalty():
+    env = PacmanEnv()
+    env.reset(seed=4)
+    env.cfg.reward.danger_penalty = 0.0  # isolate the stay-penalty term
+    env.cfg.reward.step_penalty = 0.0
+
+    # (14,23) is open left/right but walled above and below.  Put Pac-Man
+    # exactly on the tile centre facing up so the requested direction is
+    # blocked and no frame moves him.
+    pac = env.game.pacman
+    pac.x, pac.y = 14, 23
+    pac.dir = pac.next_dir = "up"
+    maze.pellets.pop((14, 23), None)
+
+    obs, reward, done, info = env.step(0)  # action 0 = up
+    assert info["stayed"], info
+    assert abs(reward - env.cfg.reward.stay_penalty) < 1e-9, reward
+    print(f"ok  stay penalty ({reward:.3f})")
+
+
+def test_dot_not_eaten_penalty():
+    reward_cfg = RewardConfig(
+        step_penalty=0.0,
+        stay_penalty=0.0,
+        dot_not_eaten_penalty=-0.02,
+        dot_not_eaten_grace=0,
+        danger_penalty=0.0,
+    )
+    cfg = EnvConfig(frame_skip=4, max_frames=18000, level_cap=1,
+                    reward=reward_cfg)
+    env = PacmanEnv(cfg)
+
+    def park_without_a_dot(seed=4):
+        env.reset(seed=seed)
+        pac = env.game.pacman
+        pac.x, pac.y = 14, 23
+        pac.dir = pac.next_dir = "up"  # walled above, no pellet here
+        maze.pellets.pop((14, 23), None)
+
+    # Zero grace: the first decision without a dot is penalised.
+    park_without_a_dot()
+    obs, reward, done, info = env.step(0)
+    assert not info["dot_eaten"], info
+    assert info["decisions_since_dot"] == 1, info
+    assert info["dot_not_eaten_penalty"], info
+    assert abs(reward - (-0.02)) < 1e-9, reward
+
+    # Grace gives the agent time before the penalty starts.
+    env.cfg.reward.dot_not_eaten_grace = 5
+    park_without_a_dot()
+    obs, reward, done, info = env.step(0)
+    assert not info["dot_not_eaten_penalty"], info
+    assert abs(reward) < 1e-9, reward
+
+    # Terminal/truncated frames are exempt.
+    env.cfg.reward.dot_not_eaten_grace = 0
+    env.cfg.max_frames = 4
+    park_without_a_dot()
+    obs, reward, done, info = env.step(0)
+    assert done and info["truncated"], info
+    assert not info["dot_not_eaten_penalty"], info
+    assert abs(reward) < 1e-9, reward
+    print("ok  dot-not-eaten penalty")
+
+
+def test_ghost_direction_observation():
+    env = PacmanEnv()
+    obs = env.reset(seed=11)
+    check_observation(obs)
+    directions = obs["ghost_dir"].reshape(4, 4)
+    assert np.all(directions.sum(axis=1) <= 1.0), directions
+    assert directions.sum() >= 1.0, "at least one ghost must have a direction"
+    print("ok  ghost-direction observation")
+
+
+def test_dot_curriculum():
+    cfg = EnvConfig(
+        frame_skip=4,
+        max_frames=18000,
+        level_cap=1,
+        dots_removed_min=80,
+        dots_removed_max=80,
+    )
+    env = PacmanEnv(cfg)
+    obs = env.reset(seed=5)
+    check_observation(obs)
+    assert env.dots_removed == 80, env.dots_removed
+    assert len(maze.pellets) == 164, len(maze.pellets)
+    assert obs["grid"][1].sum() == 160, obs["grid"][1].sum()  # ordinary dots
+    assert obs["grid"][2].sum() == 4, obs["grid"][2].sum()    # power pellets
+    initial_dots = obs["grid"][1].copy()
+    obs, reward, done, info = env.step(0)
+    assert info["dots_removed"] == 80, info
+    assert info["dots_eaten"] >= 0, info
+
+    # Same seed must remove the same dots.
+    env2 = PacmanEnv(cfg)
+    obs2 = env2.reset(seed=5)
+    assert np.array_equal(initial_dots, obs2["grid"][1])
+    print("ok  endgame dot curriculum")
+
+
+def test_danger_shaping():
+    reward_cfg = RewardConfig(
+        step_penalty=0.0,
+        stay_penalty=0.0,
+        dot_not_eaten_penalty=0.0,
+        danger_penalty=1.0,
+        danger_radius=5,
+    )
+    env = PacmanEnv(EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=1, reward=reward_cfg
+    ))
+    env.reset(seed=12)
+    pac = env.game.pacman
+    pac.x, pac.y = 14, 23
+    ghost = env.game.ghosts[0]
+    ghost.mode = "chase"
+    ghost.x, ghost.y = 16, 23
+    danger = env._danger_level()
+    assert 0.0 < danger <= 1.0, danger
+    print(f"ok  danger shaping (level={danger:.2f})")
 
 
 def benchmark(decisions=20000):
@@ -150,5 +281,10 @@ if __name__ == "__main__":
     test_level_clear()
     test_time_limit()
     test_reward_signs()
+    test_stay_penalty()
+    test_dot_not_eaten_penalty()
+    test_ghost_direction_observation()
+    test_dot_curriculum()
+    test_danger_shaping()
     benchmark()
     print("ALL STAGE-0 TESTS PASSED")

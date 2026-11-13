@@ -1,27 +1,25 @@
-# Code walkthrough: every design choice in the RL layer
+# Code walkthrough: the DQN Pac-Man system
 
-This document explains the RL code line by line.  It is written to be
-read next to the source files.  The original game files are untouched;
-everything below lives in `rl/`.
+This document explains the final RL layer next to the source files.  The
+original game files (`env.py`, `pacman.py`, `ghost.py`, `map.py`,
+`levels.py`, `game.py`) are untouched.  Only the new `rl/` package and
+`train.py` are described here.
 
 ---
 
 ## 0. How the RL layer attaches to the game
 
-The game already separates logic from rendering:
-
 - `env.Game` owns all state (Pac-Man, ghosts, pellets, timers) and has
   `update()` but no drawing.
-- `Game(fx=False)` removes READY/death/eaten pauses, so one `update()`
-  is exactly one 60 Hz game frame.
+- `Game(fx=False)` removes READY/death/eaten pauses, so one `update()` is
+  exactly one 60 Hz game frame.
 - `Pacman.set_dir(d)` is the same input a human gives with an arrow key.
 - `maze.pellets` is a module-level dict, so there can be only one `Game`
-  per process.  We therefore train with one environment per process and
-  do not try to run several `Game` objects in the same process.
-
-The wrapper never edits those files.  It reads public attributes such as
-`game.pacman`, `game.ghosts`, `game.level`, `game.fright` and
-`maze.pellets`.
+  per process.  The training script therefore uses one environment and
+  resets it for evaluation instead of creating a second game.
+- The wrapper never edits the game source.  It reads public attributes
+  such as `game.pacman`, `game.ghosts`, `game.level`, `game.fright` and
+  `maze.pellets`.
 
 ---
 
@@ -30,47 +28,64 @@ The wrapper never edits those files.  It reads public attributes such as
 ```python
 ACTIONS = ("up", "left", "down", "right")
 NUM_ACTIONS = len(ACTIONS)
-```
-
-The order is fixed for the whole project.  Action index `0` always means
-"request up", and the network's output index maps to this tuple.  The
-order itself is arbitrary for Pac-Man; it is chosen to match the
-up/left/down/right order the ghost AI already uses, which makes debugging
-easier.
-
-```python
 GRID_H, GRID_W = 31, 28
 N_CHANNELS = 8
+N_GHOSTS = 4
+GHOST_DIR_DIM = 16
 N_PELLETS = 244
 VEC_DIM = 18
 ```
 
-These are the exact maze dimensions from `map.MAZE`.  They are repeated
-here so observation code does not need to import pygame just to learn
-the maze size.  `N_PELLETS` is used to normalise "pellets left" and to
-compute pellets eaten.
+The action order is fixed for the whole project.  The network's output
+index maps to this tuple.  The maze constants are repeated here so the
+observation code does not need pygame just to learn the board size.
 
 ```python
 @dataclass
 class RewardConfig:
-    score_scale: float = 0.01
-    death_penalty: float = -5.0
-    step_penalty: float = 0.0
-    level_clear_bonus: float = 10.0
+    score_scale: float = 0.02
+    death_penalty: float = -15.0
+    step_penalty: float = -0.001
+    stay_penalty: float = -0.02
+    dot_not_eaten_penalty: float = -0.02
+    dot_not_eaten_grace: int = 45
+    level_clear_bonus: float = 20.0
+    ghost_score_scale: float = 0.5
+    danger_penalty: float = 0.02
+    danger_radius: int = 5
 ```
 
-- `score_scale=0.01` turns game points into small RL numbers: a dot
-  gives `+0.1`, a power pellet `+0.5`, ghosts `+2..+16`, fruit
-  `+1..+50`.  This keeps Q-values in a comfortable range for Adam.
-- `death_penalty=-5` is the only negative event.  The game subtracts no
-  score on death, so without this the agent could learn that suicide is
-  free.  `-5` is 50 dots' worth; it is deliberately larger than a few
-  pellets but not so large that the agent refuses to move.
-- `step_penalty=0` is off initially.  If the agent learns to wander, a
-  small value such as `-0.01` per decision encourages it to collect
-  pellets faster.  It is off now because the user asked to start simple.
-- `level_clear_bonus=10` rewards finishing level 1, which is a sparse
-  event worth 1000 game points.
+- `score_scale=0.02`: a dot is +0.2, a power pellet +1.0, ghosts
+  +4..+32 and fruit +2..+100.  This keeps Q-values in a comfortable
+  range for Adam while making pellets worth chasing.
+- `death_penalty=-15`: the game subtracts no score on death, so this is
+  the explicit survival signal.  It is large enough to discourage
+  suicide but much smaller than the value of a cleared level.
+- `step_penalty=-0.001`: a tiny cost for every decision.  It is small
+  enough not to compete with the pellet reward but discourages drifting.
+- `stay_penalty=-0.02`: charged once per decision only when Pac-Man's
+  position did not change at all.  This is the anti-camping term the
+  project asked for.  It is one tenth of a dot, so it prevents "park in a
+  corner forever" without making normal movement or a pellet pause
+  expensive.
+- `dot_not_eaten_penalty=-0.02`, `dot_not_eaten_grace=45`: after 45
+  consecutive decisions without a dot (3 seconds at the default frame
+  skip), charge -0.02 per decision until the next dot.  This is the
+  progress-pressure term.  It is distinct from the anti-stay penalty:
+  circling an empty corridor still makes no progress even while moving.
+  The counter resets on a pellet and no penalty is applied on a terminal
+  frame.
+- `level_clear_bonus=20`: clearing a level is worth 1000 base game
+  points, which is 20 reward units at `score_scale=0.02`; the same amount
+  again makes the sparse event easier to learn.
+- `ghost_score_scale=0.5`: halves only the 200/400/800/1600 ghost combo
+  points.  Without it a four-ghost chain is +60 reward, four times a death,
+  which encourages risky ghost chasing.  Dots, power pellets, fruit and the
+  displayed game score are unchanged.
+- `danger_penalty=0.02`, `danger_radius=5`: a per-decision cost when a
+  scatter/chase ghost is within five tiles, scaled linearly by closeness.
+  It is a survival gradient before the sparse death penalty, not a
+  replacement for it.
 
 ```python
 @dataclass
@@ -79,38 +94,45 @@ class EnvConfig:
     max_frames: int = 18000
     level_cap: int | None = 1
     seed: int | None = None
+    dots_removed_min: int = 0
+    dots_removed_max: int = 0
     reward: RewardConfig = field(default_factory=RewardConfig)
 ```
 
-- `frame_skip=4`: one agent decision every four game frames.  The agent
-  acts 15 times per second, while the game still runs at 60 Hz.  This is
-  the standard Atari-style action repeat.  It also makes the environment
-  about four times faster than deciding every frame.
-- `max_frames=18000`: five minutes of game time per episode.  Without a
-  limit, a policy that learns to avoid ghosts could run forever and the
-  episode would never end.
-- `level_cap=1`: end the episode after clearing level 1.  This is the
-  first training stage.  Set it to `None` (or `--level-cap 0` on the
-  command line) to let the agent continue into level 2 and beyond.
+- `frame_skip=4`: one agent decision every four game frames; the agent
+  acts 15 times per second.  This is the standard Atari-style action
+  repeat and makes the environment about four times cheaper.
+- `max_frames=18000`: five minutes of game time per episode.  A policy
+  that learns to avoid ghosts could otherwise run forever.
+- `level_cap=1`: end the episode after clearing level 1.  In `train.py`
+  this is changed per generation by the curriculum.  `None`/`0` means no
+  cap.
 - `seed`: seed for the environment's episode-seed generator.  Each
   episode still gets its own seed, so training sees different ghost
   randomness.
-- `reward`: nested config so reward tuning never changes the wrapper.
+- `dots_removed_min/max`: endgame curriculum.  At reset, a random number of
+  ordinary dots in that range is removed before the first observation.
+  Power pellets are never removed.  `Game.total` is updated so fruit timing
+  is correct.  Evaluation sets both to zero.
 
 ---
 
 ## 2. `obs.py`
 
-### Grid layout
+The observation is a dict:
 
 ```python
-grid = np.zeros((8, 31, 28), dtype=np.float32)
+obs = {
+    "grid": float32[8, 31, 28],
+    "vec": float32[18],
+    "ghost_dir": float32[16],
+}
 ```
 
-PyTorch convolutions expect `(channels, height, width)`.  Height is rows
+PyTorch convolutions expect `(channels, height, width)`, so height is rows
 (31) and width is columns (28).
 
-Channels:
+Grid channels:
 
 | index | meaning |
 | --- | --- |
@@ -123,7 +145,7 @@ Channels:
 | 6 | Inky |
 | 7 | Clyde |
 
-### Ghost values
+Ghost values:
 
 ```python
 GHOST_VALUE = {
@@ -137,93 +159,35 @@ GHOST_VALUE = {
 }
 ```
 
-This follows the game's `collide()` exactly:
-
-- `scatter`/`chase`: touching the ghost kills Pac-Man -> `1.0`.
-- `frightened`: Pac-Man can eat it -> `-1.0`.
-- `house`/`leaving`/`eaten`/`entering`: `collide()` ignores them, so
-  they are harmless -> `0.5`, not `1.0`.
-
-The network can therefore distinguish "dangerous", "edible" and
-"harmless" at a glance.
-
-### `wrap_tile`
-
-```python
-def wrap_tile(tile):
-    c, r = tile
-    return c % GRID_W, r
-```
-
-Pac-Man and ghosts can have `x=-1` or `x=28` in the warp tunnel.  The
-maze is 28 tiles wide, so modulo 28 maps those positions back onto the
-board.  `r` is always 0..30.
-
-### `build_wall_grid`
-
-```python
-for r in range(GRID_H):
-    for c in range(GRID_W):
-        if maze.is_wall(c, r):
-            walls[r, c] = 1.0
-```
-
-`maze.is_wall(c,r)` returns `True` for `#`, for the ghost door `-` when
-`door=False`, and for out-of-bounds rows.  For Pac-Man the door is a
-wall, so this is the correct mask.  It is built once per
-`ObservationBuilder`, not every frame.
-
-### `build`
-
-```python
-for (c, r), kind in maze.pellets.items():
-    channel = CH_DOT if kind == "." else CH_POWER
-    grid[channel, r, c] = 1.0
-```
-
-At most 244 iterations.  This is simpler than maintaining an incremental
-pellet grid, and it cannot go stale after level resets.
-
-```python
-pc, pr = wrap_tile(game.pacman.tile)
-grid[CH_PAC, pr, pc] = 1.0
-```
-
-`pacman.tile` is `(floor(x+0.5), floor(y+0.5))` from the game, i.e. the
-tile the game itself uses for collisions.  Using the same definition is
-important: the observation and the death rule must agree.
-
-```python
-for i, ghost in enumerate(game.ghosts):
-    gc, gr = wrap_tile(ghost.tile)
-    grid[CH_GHOST0 + i, gr, gc] = GHOST_VALUE[ghost.mode]
-```
-
-The ghost order is fixed by `Game.__init__`: Blinky, Pinky, Inky, Clyde.
-Each gets its own channel, so the network can learn that Blinky targets
-Pac-Man directly while Clyde sometimes runs away.
-
-### `_vector`
+This follows the game's `collide()` exactly: scatter/chase ghosts kill
+Pac-Man, frightened ghosts are edible, and the remaining modes are
+harmless.  The network can distinguish danger, food and irrelevant
+ghosts at a glance.
 
 The 18 scalars are:
 
-1-4. current direction one-hot (`up`, `left`, `down`, `right`).
-5-8. buffered direction one-hot (`next_dir`).  This matters because
-Pac-Man may be waiting for a tile centre before turning.
-9. `fright / 360` clipped to 1: how much frightened time is left.
-10. `1.0` if the global mode is chase, else `0.0`.
-11. `pellets_left / 244`.
-12. `elroy / 2`: Blinky's Cruise Elroy stage.
-13. `lives / 3`.
-14. `level / 21` (capped).
-15. `1.0` if Pac-Man is currently moving, else `0.0`.
-16. fraction of ghosts dangerous.
-17. fraction of ghosts frightened.
-18. fraction of ghosts harmless.
+1-4. current direction one-hot;
+5-8. buffered direction one-hot (Pac-Man may be waiting for a tile
+centre before turning);
+9. fright timer;
+10. chase/scatter flag;
+11. pellets left;
+12. Cruise Elroy stage;
+13. lives;
+14. level;
+15. moving flag;
+16-18. fraction of dangerous/frightened/harmless ghosts.
 
-The grid cannot express timers, modes, lives or level; the vector does.
-The split is deliberate: convolutions handle space, the MLP head handles
-global context.
+The grid handles space; the vector handles timers, modes, lives and level.
+
+`ghost_dir` is 16 bits: four one-hot directions for each of Blinky, Pinky,
+Inky and Clyde.  A single grid frame says where a ghost is, but not where
+it is about to go.  The direction is the missing signal for learning to
+run away.  The vector is flattened as `(ghost, direction)`, using the same
+up/left/down/right order as `ACTIONS`.
+
+`wrap_tile` handles the warp tunnel (`x=-1` and `x=28`), and the wall grid
+is built once per `ObservationBuilder` because walls never change.
 
 ---
 
@@ -233,34 +197,39 @@ global context.
 
 ```python
 self.game = Game(fx=False)
-```
-
-`fx=False` is the single most important choice for training.  It removes
-all cosmetic pauses, so `update()` advances exactly one frame.  The game
-is therefore deterministic given the seed and actions, and fast.
-
-```python
 self.rng = np.random.default_rng(self.cfg.seed)
 ```
 
-This RNG only chooses episode seeds.  It is separate from Python's
-`random`, which the game uses for frightened ghost turns and fruit
-timing.  `Game.reset(seed)` seeds that global RNG.
+`fx=False` is the most important choice for training: no cosmetic pauses,
+so `update()` advances exactly one frame.  The separate NumPy RNG only
+chooses episode seeds; Python's `random` is what the game uses for
+frightened turns and fruit timing.
 
 ### `reset`
 
 ```python
-if seed is None:
-    seed = int(self.rng.integers(0, 2**31 - 1))
-self.episode_seed = seed
+seed = int(self.rng.integers(0, 2**31 - 1))
 self.game.reset(seed=seed)
 ```
 
-Every episode gets an integer seed.  Passing the same seed and the same
-actions reproduces the episode exactly; the smoke test verifies this.
+`Game.reset` restores level 1, 244 pellets, three lives and score 0.
+Passing the same seed and actions reproduces an episode exactly; the
+smoke test verifies this.
 
-`Game.reset` also resets the level to 1, restores 244 pellets, resets
-lives to 3 and score to 0.  That is what an RL episode needs.
+After the reset, the endgame curriculum may remove ordinary dots:
+
+```python
+self._apply_dot_curriculum(seed)
+self.game.total = len(maze.pellets)
+self.dots_at_start = len(maze.pellets)
+```
+
+The removal uses a private RNG seeded from the episode seed, so it is
+deterministic.  Only `"."` tiles are eligible; the four power pellets stay.
+`Game.total` is updated because fruit timing uses `total - remaining`.
+`reset_round()` after a death does not refill pellets, so `total` stays
+correct; a level change refills the maze and the step loop resets
+`game.total` for the new level.
 
 ### `step`: action validation
 
@@ -270,245 +239,188 @@ if not isinstance(action, (int, np.integer)) or not 0 <= int(action) < NUM_ACTIO
 ```
 
 A wrong action is a programming bug, not something to silently clamp.
-This catches shape/index mistakes early.
 
-### `step`: frame loop and reward
+### `step`: reward, death, level clear, time limit
 
 ```python
 reward = float(self.cfg.reward.step_penalty)
 for _ in range(self.cfg.frame_skip):
     lives_before = self.game.pacman.lives
     score_before = self.game.pacman.score
+    combo_before = self.game.combo
     self.game.update()
-    self.frames += 1
-    reward += (self.game.pacman.score - score_before) * self.cfg.reward.score_scale
+    score_delta = self.game.pacman.score - score_before
+    ghost_points = 0
+    if self.game.combo > combo_before:
+        ghost_points = 200 * (2 ** combo_before)
+        ghost_points = min(ghost_points, max(0, score_delta))
+    base_points = score_delta - ghost_points
+    reward += base_points * self.cfg.reward.score_scale
+    reward += (ghost_points * self.cfg.reward.score_scale
+               * self.cfg.reward.ghost_score_scale)
 ```
 
-The score delta covers dots, power pellets, eaten ghosts and fruit in one
-line, because the game already adds all of those to `pacman.score`.
-`lives_before` is captured per frame, not per decision, because a death
-can happen on any of the four skipped frames.
+`combo` increments only when a frightened ghost is eaten, so the wrapper
+can separate ghost-combo points from dots, power pellets and fruit.  The
+base score keeps `score_scale`; the ghost part is multiplied again by
+`ghost_score_scale`.  This is why `ghost_score_scale` can reduce risky
+ghost farming without changing pellet rewards or the displayed game score.
 
-### `step`: death detection
+A death is detected by `pacman.lives` decreasing, not by `pacman.alive`.
+With `fx=False`, `collide()` sets `alive=False`, decrements lives, and
+then `finish_death()` immediately respawns Pac-Man.  The wrapper stops the
+current skip immediately because respawn resets the direction to `left`;
+continuing would move Pac-Man with an action the agent did not choose.
+
+A level clear happens when `game.level > level_cap`; the wrapper adds the
+clear bonus and ends the episode.  Hitting `max_frames` is a
+**truncation**, not a terminal state, and is reported through
+`info["truncated"]`.
+
+### `step`: the anti-stay penalty
 
 ```python
-if self.game.pacman.lives < lives_before:
-    died = True
-    reward += self.cfg.reward.death_penalty
-    if self.game.game_over:
-        done = True
-    break
+moved = False
+last_pos = (self.game.pacman.x, self.game.pacman.y)
+...
+if (self.game.pacman.x, self.game.pacman.y) != last_pos:
+    moved = True
+    last_pos = (self.game.pacman.x, self.game.pacman.y)
+...
+stayed = not moved and not died and not level_cleared and not truncated
+if stayed:
+    reward += self.cfg.reward.stay_penalty
 ```
 
-This is the subtle part.  With `fx=False`, `collide()` sets
-`pac.alive=False`, decrements lives, then `finish_death()` immediately
-respawns Pac-Man and sets `alive=True` again.  So checking `alive` after
-`update()` would miss the death.  The lives counter is the reliable
-signal.
+Position is used instead of `pacman.moving` because `moving` is only
+refreshed at tile centres and can be stale during a pellet pause.  The
+penalty is applied once per decision, not once per game frame, and never
+on a terminal frame.  `info["stayed"]` exposes the flag for tests and
+debugging.
 
-The `break` is also deliberate.  `respawn()` sets `dir='left'` and
-`next_dir='left'`.  If the wrapper continued the remaining skip frames,
-Pac-Man would move left with an action the agent did not choose.  Stopping
-lets the agent make a fresh decision at the spawn point.
+### `step`: the no-dot progress penalty
 
-### `step`: game over, level clear, time limit
+`len(maze.pellets)` is sampled before and after each game frame.  A
+decrease means a dot or power pellet was eaten; a level change also sets
+`dot_eaten=True` because `next_level()` refills the maze immediately.
 
 ```python
-if self.game.game_over:
-    done = True
-    break
+if dot_eaten or died or level_cleared:
+    self.decisions_since_dot = 0
+else:
+    self.decisions_since_dot += 1
 
-if self.cfg.level_cap is not None and self.game.level > self.cfg.level_cap:
-    level_cleared = True
-    reward += self.cfg.reward.level_clear_bonus
-    done = True
-    break
-
-if self.frames >= self.cfg.max_frames:
-    truncated = True
-    done = True
-    break
+dot_not_eaten = (
+    not done and not dot_eaten
+    and self.decisions_since_dot >= reward.dot_not_eaten_grace
+)
+if dot_not_eaten:
+    reward += reward.dot_not_eaten_penalty
 ```
 
-- `game_over` means all lives are gone.  This is a true terminal state.
-- `level > level_cap` means `next_level()` just ran.  We treat clearing
-  the target level as a successful terminal state and add the bonus.
-- hitting `max_frames` is a **truncation**, not a terminal state.  DQN
-  still bootstraps from the last observation; Q-learning can also
-  bootstrap.  The `info["truncated"]` flag is what tells the training
-  loops the difference.
+This is a progress signal, not another movement signal.  Pac-Man can move
+every frame through an empty corridor and still get the penalty.  It
+starts after 45 decisions without a pellet by default and is skipped on
+death, clear and timeout frames.  `info["dot_eaten"]`,
+`info["decisions_since_dot"]` and `info["dot_not_eaten_penalty"]` expose
+the state for tests.
+
+### `step`: danger shaping
+
+After the frame loop, the wrapper measures the closest scatter/chase ghost
+using wrapped Manhattan distance:
+
+```python
+danger = self._danger_level()
+if danger:
+    reward -= danger * self.cfg.reward.danger_penalty
+```
+
+The danger level is 1 at distance 1 and falls linearly to 0 at
+`danger_radius`.  It is skipped on terminal frames, where the death
+penalty and the respawn already dominate.  This is a small gradient toward
+running away before a death happens; it is not a hard rule.
 
 ### `info`
 
 ```python
 info = {
     "episode_seed": ..., "frames": ..., "level": ..., "score": ...,
-    "lives": ..., "dots_left": ..., "died": ..., "level_cleared": ...,
-    "truncated": ..., "episode_return": ...,
+    "lives": ..., "dots_left": ..., "dots_eaten": ...,
+    "dots_removed": ..., "dots_at_start": ..., "died": ...,
+    "level_cleared": ..., "truncated": ..., "stayed": ...,
+    "dot_eaten": ..., "decisions_since_dot": ...,
+    "dot_not_eaten_penalty": ..., "ghost_score": ...,
+    "danger": ..., "danger_penalty": ..., "episode_return": ...,
 }
 ```
 
-Every training script logs from this dict.  Keeping it in one place means
-the plots and the CSV files agree.
+Every script logs from this dict, so plots, CSV files and evaluation agree.
 
 ---
 
-## 4. Tabular Q-learning (`agents/qlearning.py`)
-
-### Why a compressed state
-
-A real Q-table over the raw game would need one entry per
-`(position, pellet configuration, ghost configuration, timers)`.  There
-are 244 pellets, so the pellet part alone has `2**244` configurations.
-That is not a table; it is the universe.
-
-The baseline therefore uses seven features:
-
-```text
-(col, row, 4-neighbour pellet bits, nearest-ghost sector,
- nearest-ghost distance bucket, fright bucket, current direction)
-```
-
-- `(col,row)` is 868 tiles; it lets the agent learn the maze layout.
-- The four pellet bits say whether the tile above/left/right/below still
-  has a pellet.  This is the local "where should I go next" signal.
-- The nearest dangerous ghost is compressed to an 8-way sector and a
-  distance bucket (`0..2`, `3..5`, `6..9`, `10+`).  This is enough to
-  learn "run away from the red thing".
-- The fright bucket (none, <=2 s, >2 s) lets it switch between fleeing
-  ghosts and chasing them.
-- The direction is needed because Pac-Man's legal turn behaviour
-  depends on where he is already facing.
-
-Even this is millions of states, so `self.q` is a Python dict and rows
-are created only when visited.  That is still tabular Q-learning: each
-discrete state has its own four numbers.
-
-### Update rule
+## 4. `networks.py`: a dueling Q-network
 
 ```python
-target = reward
-if not terminal:
-    next_row = self.q.get(next_state)
-    if next_row is not None:
-        target += self.gamma * float(next_row.max())
-row[action] += self.alpha * (target - row[action])
+self.conv = nn.Sequential(
+    nn.Conv2d(8, 32, 3, padding=1), nn.ReLU(),
+    nn.Conv2d(32, width, 3, stride=2, padding=1), nn.ReLU(),
+    nn.Conv2d(width, width, 3, stride=2, padding=1), nn.ReLU(),
+    nn.Flatten(),
+)
+self.ghost_mlp = nn.Sequential(
+    nn.Linear(16, 64), nn.ReLU(), nn.Linear(64, 64), nn.ReLU()
+)
+self.trunk = nn.Sequential(nn.Linear(conv_out + 18 + 64, 512), nn.ReLU())
+self.value = nn.Linear(512, 1)
+self.advantage = nn.Linear(512, NUM_ACTIONS)
 ```
 
-This is the standard TD(0) update:
-`Q(s,a) <- Q(s,a) + alpha * (r + gamma * max Q(s',a') - Q(s,a))`.
+The `ghost_mlp`/extra 64 inputs exist only when `use_ghost_dir=True`.
+An old checkpoint therefore has exactly the old parameter names and
+shapes.  `--partial-load` copies the old columns of `trunk.0.weight` and
+zeros the new ones, so the old policy is preserved at the start of the new
+run.
 
-If `next_state` has never been seen, its value is implicitly zero.  That
-is the usual optimistic initialisation, and it encourages the agent to
-visit new states.
+The first convolution learns local patterns such as "wall next to a
+pellet" or "ghost two tiles away".  The stride-2 layers reduce 31x28 to
+8x7, keeping the fully connected part small.  The 18 scalars and the
+64-unit ghost-direction embedding are concatenated after the convolution
+so the head can mix "what is where", "where is each ghost going" and "what
+mode am I in".
 
-### Exploration
+The dueling head computes:
 
 ```python
-if not greedy and self.rng.random() < self.epsilon:
-    return self.rng.randrange(NUM_ACTIONS)
+value = self.value(hidden)
+advantage = self.advantage(hidden)
+return value + advantage - advantage.mean(dim=1, keepdim=True)
 ```
 
-During training the agent explores with probability epsilon.  Epsilon
-decays linearly from 1.0 to 0.05 over 200k decisions.  During evaluation
-`greedy=True` disables exploration entirely; ties are broken
-deterministically with `np.argmax`, so the evaluation is reproducible.
+Many Pac-Man states have nearly identical action values (an empty
+corridor), while a few need a very different escape action.  Splitting
+value and advantage makes that structure easier to learn and stabilises
+the update.
 
-### Hyperparameters
-
-- `alpha=0.1`: a moderate learning rate.  Tabular Q-learning can use
-  larger rates than neural networks, but 0.1 keeps the values from
-  oscillating when a state is revisited.
-- `gamma=0.99`: with a decision every 4 frames, the effective horizon is
-  about 100 decisions = 6.7 seconds.  That is long enough to value
-  survival and short enough to learn.
-- `epsilon 1.0 -> 0.05`: early decisions are almost entirely random,
-  which fills the table; late decisions are mostly greedy.
+The output size is computed with a dummy tensor, so changing the maze size
+does not silently break the head.
 
 ---
 
-## 5. DQN
+## 5. `agents/dqn.py`: Double DQN
 
-### 5.1 Network (`networks.py`)
-
-```python
-nn.Conv2d(8, 32, kernel_size=3, padding=1)
-nn.Conv2d(32, width, kernel_size=3, stride=2, padding=1)
-nn.Conv2d(width, width, kernel_size=3, stride=2, padding=1)
-```
-
-- The first convolution looks at 3x3 patches and learns local patterns
-  such as "wall next to a pellet" or "ghost two tiles away".
-- The two stride-2 layers halve the spatial size twice: 31x28 -> 16x14
-  -> 8x7.  This keeps the fully connected layer small.
-- `width` is 64 by default and 32 in the reported DQN runs.  A width-64
-  network was measured at about 1.4x slower with no clear benefit for
-  this maze, so the final 1M-decision runs use width 32.
+Two identical networks are created:
 
 ```python
-features = self.conv(grid)
-features = torch.cat([features, vec], dim=1)
-return self.head(features)
-```
-
-The convolutional features are flattened to `64*8*7 = 3584` numbers and
-concatenated with the 18 scalars.  The 512-unit hidden layer mixes
-"what is where" with "what mode am I in", and the final layer outputs one
-Q-value per action.
-
-The output size is computed with a dummy tensor in `__init__` rather than
-hard-coded arithmetic.  If the maze size ever changes, the network still
-works.
-
-### 5.2 Replay buffer (`buffer.py`)
-
-```python
-self.grid = np.zeros((capacity, 8, 31, 28), dtype=np.int8)
-self.next_grid = np.zeros_like(self.grid)
-```
-
-A transition stores both `obs` and `next_obs`, because the DQN target
-needs the next state.  Storing them as int8 codes is important:
-
-```python
-def encode_grid(grid):
-    return np.rint(grid * 2.0).astype(np.int8)
-```
-
-The observation values are `0`, `0.5`, `-1`, `1`.  Multiplying by 2
-gives `0`, `1`, `-2`, `2`, which fit in int8 exactly.  The agent divides
-by 2 on the GPU.  A 100k buffer therefore uses about 1.4 GB instead of
-5.6 GB.
-
-The buffer is a ring buffer:
-
-```python
-self.pos = (self.pos + 1) % self.capacity
-self.size = min(self.size + 1, self.capacity)
-```
-
-When it is full, the oldest transition is overwritten.  Sampling is
-uniform:
-
-```python
-idx = self.rng.integers(0, self.size, size=batch_size)
-```
-
-Uniform sampling is the original DQN choice.  Prioritised replay is a
-later upgrade.
-
-### 5.3 Agent (`agents/dqn.py`)
-
-```python
-self.online = QNetwork(width=width).to(self.device)
-self.target = QNetwork(width=width).to(self.device)
+self.online = QNetwork(width=width, use_ghost_dir=use_ghost_dir)
+self.target = QNetwork(width=width, use_ghost_dir=use_ghost_dir)
 self.target.load_state_dict(self.online.state_dict())
 ```
 
-Two identical networks.  The online network is trained; the target
-network is a slowly changing copy used to compute stable TD targets.
-Without it, the target moves every time the online network updates and
-training can diverge.
+The online network is trained; the target network is a slowly changing
+copy used for stable TD targets.
+
+Action selection:
 
 ```python
 def act(self, obs, greedy=False):
@@ -518,227 +430,76 @@ def act(self, obs, greedy=False):
     return int(q.argmax(dim=1).item())
 ```
 
-Epsilon-greedy action selection.  `greedy=True` is used only for
-evaluation and for the live viewer.
+`greedy=True` is used for evaluation and live play.
+
+The update:
 
 ```python
-q = self.online(grid, vec).gather(1, action.unsqueeze(1)).squeeze(1)
-```
-
-`gather` picks the Q-value of the action that was actually taken.  The
-result has shape `(batch,)`.
-
-Double DQN target:
-
-```python
+q = self.online(grid, vec, ghost_dir).gather(
+    1, action.unsqueeze(1)
+).squeeze(1)
 with torch.no_grad():
-    next_actions = self.online(next_grid, next_vec).argmax(dim=1, keepdim=True)
-    next_q = self.target(next_grid, next_vec).gather(1, next_actions).squeeze(1)
+    next_actions = self.online(
+        next_grid, next_vec, next_ghost_dir
+    ).argmax(dim=1, keepdim=True)
+    next_q = self.target(
+        next_grid, next_vec, next_ghost_dir
+    ).gather(1, next_actions).squeeze(1)
     target = reward + self.gamma * next_q * (1.0 - terminal)
-```
-
-The online network chooses the next action; the target network evaluates
-it.  This reduces the over-estimation that plain DQN gets from
-`max` over noisy Q-values.  `(1.0 - terminal)` zeroes the bootstrap at
-real terminal states, but keeps it at time-limit truncations.
-
-```python
 loss = F.smooth_l1_loss(q, target)
 ```
 
-Huber loss behaves like squared error for small TD errors and like
-absolute error for large ones, which makes it robust to occasional
-outliers (for example, eating a ghost for +16).
+The online network chooses the next action; the target network evaluates
+it.  This is Double DQN and reduces the over-estimation of plain DQN.
+`(1.0 - terminal)` zeroes the bootstrap at real terminal states but keeps
+it at time-limit truncations.
 
-```python
-nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
-```
+Huber loss behaves like squared error for small errors and absolute error
+for large ones, which is robust to rare large rewards such as eating a
+ghost.  Gradients are clipped at 10.  The target network is copied every
+2,000 gradient steps.
 
-Gradient clipping at 10 prevents a single large TD error from destroying
-the network.
+`save()` stores the online and target networks, optimizer, decision count,
+update count, epsilon and the architecture flags (`use_ghost_dir`, `width`,
+`lr`), so `--resume` restores the policy, optimiser state and exploration
+schedule.  The replay buffer is deliberately not saved (it is large); it
+starts empty and refills from new experience.
 
-```python
-if self.updates % self.target_update == 0:
-    self.target.load_state_dict(self.online.state_dict())
-```
-
-The target network is refreshed every 2000 gradient steps.  Too frequent
-and it behaves like plain DQN; too slow and the targets become stale.
-
----
-
-## 6. Training loops
-
-### Q-learning (`train_q.py`)
-
-The loop is deliberately simple:
-
-```python
-state = agent.state_from_game(env.game)
-action = agent.act(state)
-obs, reward, done, info = env.step(action)
-next_state = agent.state_from_game(env.game)
-terminal = done and not info["truncated"]
-agent.learn(state, action, reward, next_state, terminal)
-state = next_state
-```
-
-`terminal` is true only for game over or a real episode end.  A time-limit
-truncation still bootstraps, because the game did not actually end.
-
-Evaluation happens only at episode boundaries.  Evaluating in the middle
-of an episode would call `env.reset()` and destroy the training episode.
-The cost is that an evaluation can be delayed by at most one episode.
-
-### DQN (`train_dqn.py`)
-
-```python
-if decision <= args.warmup:
-    action = rng.randrange(4)
-else:
-    action = agent.act(obs)
-```
-
-The first 5000 decisions are random.  This fills the replay buffer with
-diverse transitions before the first gradient step.  Training on a buffer
-that contains only a handful of near-identical states is unstable.
-
-```python
-agent.remember(obs, action, reward, next_obs, terminal)
-agent.update_epsilon()
-if decision > args.warmup and decision % args.train_every == 0:
-    loss = agent.learn()
-```
-
-One environment step, one stored transition, one epsilon decay, and
-optionally one gradient step.  `train_every=2` means one update per two
-decisions (one per eight game frames).  This was chosen after measuring
-the GPU: it roughly halves wall-clock time with only a small sample
-efficiency cost.  Use `--train-every 1` for the standard one-update-per-
-decision setting if you have more time.
+`load()` rebuilds the network automatically when an old checkpoint uses a
+different observation architecture, so `rl.eval_agent`, `rl.watch` and
+`rl.record` can open both old and new checkpoints without extra flags.  With
+`allow_partial=True` (`train.py --partial-load`), it instead keeps the new
+architecture and copies every shape-compatible tensor.  The old trunk
+columns load and the new ghost-direction columns start at zero, which makes
+the transferred policy exactly equal to the old one before training.
 
 ---
 
-## 7. Evaluation (`evaluate.py`)
+## 6. `buffer.py`: the replay buffer
 
 ```python
-levels_cleared = info["level"] - 1
-dots_eaten = levels_cleared * N_PELLETS + (N_PELLETS - info["dots_left"])
-deaths = 3 - info["lives"]
+self.grid = np.zeros((capacity, 8, 31, 28), dtype=np.int8)
+self.next_grid = np.zeros_like(self.grid)
+self.ghost_dir = np.zeros((capacity, 16), dtype=np.int8)
+self.next_ghost_dir = np.zeros_like(self.ghost_dir)
 ```
 
-- `info["level"] - 1` counts cleared levels, even if the agent continued
-  into the next one.
-- `dots_eaten` adds 244 for every cleared level plus the pellets eaten on
-  the current level.
-- `deaths` is derived from lives, not from the last step's `died` flag,
-  so it is correct even if the final step was not the death step.
+A transition stores both `obs` and `next_obs` because the DQN target needs
+the next state.  Observations are multiplied by 2 and stored as int8:
+values are `0`, `0.5`, `-1`, `1`, so the encoded values `0`, `1`, `-2`,
+`2` fit exactly.  A 100k buffer uses about 1.4 GB instead of 5.6 GB; the
+ghost-direction bits add only 1.6 MB.  They are stored even when the current
+agent ignores them, so one buffer layout works for both architectures.
 
-Evaluation uses fixed seeds `10000 + i`.  Both algorithms see exactly the
-same ghost randomness, which makes the comparison paired and fair.
-
-### How to read the CSV logs
-
-`runs/<experiment>/metrics.csv` has one row per evaluation:
-
-| Column | Meaning |
-| --- | --- |
-| `decision` | training decisions seen so far |
-| `episode` | training episodes completed so far |
-| `epsilon` | exploration rate at that moment |
-| `updates` | DQN gradient steps (Q-learning leaves this empty) |
-| `loss_mean` | mean DQN Huber loss during the last episode |
-| `return_mean/std` | greedy evaluation return |
-| `score_mean/std` | greedy evaluation game score |
-| `dots_mean/std` | pellets eaten per episode |
-| `frames_mean/std` | survival time in game frames |
-| `deaths_mean/std` | deaths per episode (normally 3) |
-| `clears_mean/std` | levels cleared per episode |
-| `wall_seconds` | real training time when the evaluation ran |
-
-`runs/<experiment>/episodes.csv` has one row per *training* episode.
-That is the noisy exploration data; `metrics.csv` is the clean greedy
-evaluation.  Always compare algorithms on `metrics.csv`, not on the
-training episode returns.
-
-`runs/eval_*.json` contains the final 30-episode evaluation, including
-the per-episode rows.  `runs/seed_summary.json` aggregates those across
-training seeds and is what the report's final table uses.
+The buffer is a ring buffer; when full, the oldest transition is
+overwritten.  Sampling is uniform.  Prioritised replay is a possible
+future upgrade, not part of the final working system.
 
 ---
 
-## 8. Plotting and viewing
+## 7. `train.py`: the single entry point
 
-`plot.py` reads the `metrics.csv` files, plots mean +/- standard
-deviation for return, score, pellets, survival frames, deaths and clears,
-and draws a dashed random-play baseline.  The final-checkpoint bar chart
-is a quick visual summary.
-
-`watch.py` deliberately uses `frame_skip=1` and asks the agent for a new
-action every four rendered frames.  That keeps the game at 60 FPS and
-makes the animation smooth, while the agent still behaves like it did
-during training (one decision per four frames).  It duplicates a small
-amount of drawing code from `game.py` because `game.py` runs its main
-loop at import time; importing it would start the human game.
-
----
-
-## 9. Design choices and trade-offs
-
-**Full grid vs egocentric crop.**  The full 28x31 grid is simple and
-lets the network see the whole maze, which is good for level 1.  It also
-makes it easy to overfit to one level.  An egocentric crop (for example
-15x15 around Pac-Man) would generalise better across levels and be
-cheaper, but it is a later ablation, not the first version.
-
-**Frame skip 4.**  A human reacts in roughly 100-200 ms.  Four frames is
-67 ms, which is fast but not super-human.  It also keeps the episode
-short enough to train in minutes.  Frame skip 2 would react faster but
-quadruple the number of decisions and slow training.
-
-**Reward scale.**  A dot is +0.1 and a death is -5.  This makes survival
-worth about 50 dots.  If the agent camps in a corner, increase the step
-penalty or the pellet reward; if it suicide-runs, make the death penalty
-more negative.  These are the first knobs to tune.
-
-**Q-learning state.**  The hand-designed state is intentionally compact
-so that the baseline is genuinely tabular and trains in seconds.  It
-cannot see the whole maze or all four ghosts, so its ceiling is lower
-than DQN's.  That is exactly the comparison the project is testing.
-
-**Seeds.**  A single training run is an anecdote.  The experiment script
-runs three seeds per algorithm and evaluates each on 30 fixed evaluation
-seeds.  Report mean and standard deviation, not one lucky run.
-
----
-
-## 10. Extending to PPO / actor-critic
-
-The environment, observation, reward and evaluation code are
-algorithm-agnostic.  To add PPO later:
-
-1. Add a policy network with two heads: action logits and state value.
-2. Collect a rollout of `N` decisions, storing `obs`, `action`,
-   `log_prob`, `value`, `reward`, `done`, `truncated`.
-3. Compute returns and advantages with GAE(lambda).
-4. Optimise the clipped surrogate objective plus a value loss and an
-   entropy bonus.
-5. Keep the same `evaluate()` and `watch.py` interfaces.
-
-A2C is the same idea without the clipped update and with a shorter
-rollout.  DPO is not a standard online RL algorithm for this setting; it
-is preference optimisation for generative models, so it is not the next
-step for Pac-Man.
-
----
-
-## 11. `train.py`: one-file train, GIF, evaluate, live play
-
-`train.py` is the only new top-level file.  It is intentionally a thin
-orchestrator: all game logic and all RL algorithms stay in the tested
-`rl/` package.
-
-### 11.1 SDL setup before importing pygame
+### 7.1 SDL setup
 
 ```python
 _HEADLESS_FLAG = "--headless" in sys.argv
@@ -747,112 +508,303 @@ if _HEADLESS_FLAG or _NO_DISPLAY:
     os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 ```
 
-SDL reads `SDL_VIDEODRIVER` when the video subsystem is initialised, not
-when `pygame` is imported.  Setting it *before* `import pygame` removes
-any ambiguity.  On a desktop the variable is left alone, so the final
-game opens a normal window.  On a server, or with `--headless`, pygame
-still creates surfaces and fonts, but no display is required.
+This happens before pygame is imported.  On a desktop the final game opens
+a window; on a server, or with `--headless`, pygame still creates
+surfaces and fonts but needs no display.
 
-### 11.2 Drawing to a surface
+### 7.2 Drawing
 
-`draw_game()` mirrors `game.py`'s `draw()` but takes a `Surface` argument.
-Training calls it on a 224x288 off-screen surface; the live game calls it
-on the display surface after `set_maze_scale()`.  It uses the original
+`draw_game()` mirrors `game.py`'s `draw()` but writes to an arbitrary
+surface.  Training renders a 224x288 off-screen frame; the live game uses
+the display surface after `set_maze_scale()`.  It calls the original
 `map.build_walls`, `map.draw_pellets`, `Pacman.draw` and `Ghost.draw`, so
-the visual is the real game, not a reimplementation.
+the recorded visual is the real game.
 
-`set_maze_scale()` writes `map.winScale`, `gridSize`, `offset_y`, `t`
-and `r`.  These are drawing-only globals; game physics never reads them.
-Training uses scale 1, the live window uses scale 3 by default so the
-whole 224x288 board fits on a laptop screen.
+### 7.3 Streamed GIF
 
-### 11.3 Streaming GIF recorder
-
-A list of 100,000 frames at 224x288 would be about 19 GB of raw RGB and
-far more as Python objects.  `FFmpegGIFRecorder` instead starts ffmpeg
-with `stdin=PIPE` and writes one frame at a time:
+A list of 100,000 frames at 224x288 would need about 19 GB of raw RGB.
+`FFmpegGIFRecorder` instead pipes one frame at a time into ffmpeg:
 
 ```text
-PyGame Surface -> pg.image.tobytes(..., "RGB") -> ffmpeg rawvideo -> MP4
+PyGame Surface -> RGB bytes -> rawvideo -> MP4
 MP4 -> palettegen -> paletteuse -> GIF
 ```
 
-The first pass is lossless-enough H.264 at `-crf 26`; the GIF stage then
-runs two separate ffmpeg commands: `palettegen` writes a small palette
-PNG, and `paletteuse` applies it with a Bayer dither.  The two passes are
-deliberately separate.  A single `palettegen+paletteuse` filter graph
-makes `paletteuse` buffer every frame while it waits for the palette,
-which is fine for a short clip but gets OOM-killed on 100,000 frames.
-Two passes keep memory bounded.  This is also smaller than Pillow's
-per-frame quantisation.
+The palette pass and the palette-application pass are separate.  A single
+`palettegen+paletteuse` graph makes `paletteuse` buffer every frame while
+it waits for the palette, which is OOM-killed on 100,000 frames.  Two
+passes keep memory bounded.  The recorder checks free disk space every
+2,000 frames and stops capturing rather than filling the filesystem; the
+checkpoint is never lost.
 
-The recorder checks free disk space every 2,000 frames.  If the disk is
-nearly full it stops capturing and leaves the checkpoint intact; training
-does not crash.  The intermediate MP4 is deleted after a successful GIF
-unless `--keep-mp4` is passed.
+### 7.4 Generations and curriculum
 
-### 11.4 How 100,000 frames are chosen
+The decision budget is split evenly:
 
 ```python
-record_every = max(1, args.total_decisions // args.gif_frames)
+base_decisions, extra = divmod(args.total_decisions, args.generations)
 ```
 
-With the defaults (`1,000,000` decisions, `100,000` frames) this is 10:
-one frame after every tenth decision.  One decision is four game frames,
-so consecutive GIF frames are 40 game frames apart.  The GIF is therefore
-a timelapse of the whole training run, not 28 minutes of one episode.  If
-`--total-decisions` is smaller than `--gif-frames`, every decision is
-captured and the GIF has fewer than 100,000 frames; it cannot invent
-frames that were never played.
+For each generation the script chooses a level cap:
 
-Frames are captured before `env.reset()`, so the terminal frame of each
-episode (death or level clear) is included.
+```python
+if args.curriculum:
+    cap = generation if generation <= args.curriculum_max_level else None
+else:
+    cap = args.level_cap if args.level_cap > 0 else None
+```
 
-### 11.5 Training loop
+The network and replay buffer are created once, outside the generation
+loop.  Only `env.cfg.level_cap` changes.  This is one continuous training
+run, not five independent runs.
 
-The loop is deliberately the same as `train_dqn.py` / `train_q.py`:
+The endgame curriculum is a separate, per-episode axis:
 
-1. Q-learning builds its compact state from `env.game`; DQN uses the
-   observation returned by `env.step()`.
-2. During DQN warmup the action is uniformly random and only fills the
-   replay buffer.
-3. `env.step(action)` advances four game frames and returns the summed
-   reward.
-4. Q-learning updates immediately; DQN stores the transition, decays
-   epsilon, and takes one gradient step every `--train-every` decisions.
-5. On `done`, the episode row is written to `episodes.csv`.
-6. Every `--save-every` decisions the checkpoint is overwritten.
+```python
+EnvConfig(
+    ...,
+    dots_removed_min=args.dots_removed_min,
+    dots_removed_max=args.dots_removed_max,
+)
+```
 
-`terminal = done and not info["truncated"]` is important: a time-limit
-truncation is not a real terminal state, so the Q target still
-bootstraps from the next observation.  A death or level clear is
-terminal and does not bootstrap.
+Every training episode samples a number of ordinary dots to remove before
+the first observation.  This is what gives the agent repeated practice on
+the last 80 pellets.  It is not a start-level curriculum: every episode
+still begins on level 1.  Evaluation temporarily sets both bounds to zero,
+so a full-level score is always comparable.
 
-### 11.6 Checkpoint and evaluation
+### 7.5 Warmup and epsilon
 
-The checkpoint is `dqn.pt` or `q.pkl` in `--out`.  `run.json` records the
-configuration and elapsed time.  After the GIF is finalised, the script
-runs `rl.evaluate.evaluate()` on the fixed seeds `10000..10000+N-1`,
-exactly like the report experiments.  `--eval-episodes 0` skips this if
-you want the live game immediately.
+```python
+if global_decision <= warmup:
+    action = rng.randrange(4)
+else:
+    action = agent.act(obs)
+```
 
-Reward settings come from `rl/config.RewardConfig`.  `--score-scale` and
-`--death-penalty` override them for one run without editing the shared
-config.  For example, the report's experiments used
-`--score-scale 0.01 --death-penalty -5`.
+The first 5,000 decisions are random and only fill the replay buffer.
+Training on a buffer containing only a handful of near-identical states is
+unstable.  For a short smoke run the warmup is reduced to at most one
+quarter of the budget.  `--resume` sets warmup to zero so a learned policy
+is not destroyed.  On resume, `detect_last_generation()` reads
+`progress.json` (written after every generation) or `run.json` and starts
+at the next unfinished generation.  `--start-generation` overrides that
+when a generation should deliberately be repeated.  `--total-decisions` is
+the remaining decision budget, not the original total.  `--resume-from
+PATH` loads an explicit checkpoint instead of `<out>/dqn.pt`; pairing it
+with a new `--out` preserves the original run's logs and GIF.
+`--reset-epsilon` sets the loaded agent's decision counter to zero and
+epsilon back to 1.0, which is useful when a checkpoint has settled into a
+local policy.  `--partial-load` transfers an old architecture into the new
+ghost-direction network; the old policy is preserved exactly because the
+new input columns start at zero.
 
-### 11.7 Live game
+`agent.update_epsilon()` decays linearly from 1.0 to `--epsilon-end`
+(0.02) over `--epsilon-decay` decisions (500k by default).  A long run can
+pass `--epsilon-decay 3000000` so exploration lasts longer.
 
-The live game uses a fresh `Game(fx=True)`, which restores READY!, death
-pauses and score popups.  It does not use `PacmanEnv`, so it is not
-limited by `level_cap=1` and will continue into level 2+ if Pac-Man
-clears the board.  The loop:
+### 7.6 Learning-rate decay
 
-1. asks the greedy policy for a direction every four frames;
-2. calls `pacman.set_dir(...)` and `game.update()`;
-3. draws and waits for 60 FPS;
-4. stops when `game.game_over` is true, i.e. after all three lives.
+```python
+if args.lr_final is not None:
+    frac = min(1.0, global_decision / args.total_decisions)
+    set_learning_rate(agent, args.lr + frac * (args.lr_final - args.lr))
+```
 
-`--live-max-frames` is a safety cap for automated tests; the default `0`
-means "play until death", as requested.  `--no-watch` runs the same loop
-without a window, which is how the script is tested on a headless server.
+This is optional.  A final rate of `1e-5` lets the network settle instead
+of oscillating around a good policy at the end of a multi-million-decision
+run.
+
+### 7.7 Episode bookkeeping
+
+On `done`, the script writes one row to `episodes.csv`:
+
+```text
+generation, episode, decision, return, score, dots, dots_removed,
+frames, deaths, clears, epsilon, loss_mean
+```
+
+`dots` is the true number of pellets eaten in the episode (from
+`info["dots_eaten"]`), not a full-level equivalent.  `dots_removed` records
+the endgame-curriculum head start, so a low pellet count in a curriculum
+episode is explainable.  `deaths` is `3 - lives`.  The CSV is flushed after
+every episode so a long run can be inspected while it is still going.
+
+### 7.8 Evaluation and best checkpoint
+
+After each generation:
+
+```python
+result = run_eval(eval_cap)
+```
+
+`run_eval` temporarily changes `env.cfg.level_cap` and sets
+`dots_removed_min = dots_removed_max = 0`, so evaluation always uses the
+full maze.  With `--eval-level-cap 0`, every generation is measured on the
+full game; with the default `-1`, it follows the training cap.
+
+A resumed checkpoint is evaluated before any new training and is entered
+as **generation 0**.  This baseline is important: without it, a
+continuation could finish below the policy it started from and still be
+called "best".  If the output directory already has a `best.json`, the
+resume keeps that saved best and does not overwrite it with the latest
+checkpoint.  `load_previous_generation_rows()` also re-reads the old
+`run.json`/`eval_genN.json` files so the final table and the six-panel
+showcase stay continuous across an interrupted run.
+
+The comparison metric is lexicographic:
+
+```python
+metric = (result["clears_mean"], result["dots_mean"], result["score_mean"])
+```
+
+Level clears dominate, then pellets, then score.  A new best saves
+`best.pt` and `best.json`; `best_source` records whether it came from
+generation 0 or a later generation.  The final live game loads `best.pt`
+unless `--no-best` is passed.
+
+### 7.9 Report and plots
+
+`train.py` writes `run.json` first, then calls
+`rl.report.build_report(out)`.  The report module rebuilds `metrics.csv`
+from the generation evaluations in `run.json`, summarises `episodes.csv`,
+and writes:
+
+- `stats.json`: machine-readable run + episode summary;
+- `summary.md`: a human-readable generation table and artifact list;
+- `training_showcase.png`: one presentation-ready six-panel figure with
+  training score/pellets/survival, episode return, DQN loss, and greedy
+  evaluation by generation.
+
+The plotting code lives in `rl/plot.py`.  It deliberately replaces the old
+separate `training_curves*.png` and `training_episodes.png` files: the
+evaluation-only curve could contain a single point, and the final-bars
+chart became meaningless once Q-learning was removed.  The six panels are
+score, pellets and survival (training plus greedy-evaluation markers),
+training return, DQN loss, and greedy evaluation score/pellets by
+generation.  The figure also includes a subtitle with the episode/decision
+counts and a text box with the latest evaluation, so it can be dropped
+straight into a presentation.
+
+The same report can be rebuilt for a run created before this feature
+existed, or while a run is still training:
+
+```bash
+python -m rl.report --run runs/train_dqn
+```
+
+`--no-report` skips the report when only checkpoints are wanted.
+
+### 7.10 Final live game
+
+The live game uses a fresh `Game(fx=True)`, restoring READY!, death pauses
+and score popups.  It does not use `PacmanEnv`, so it is not limited by
+`level_cap` and continues into level 2+ after a clear.  It asks the greedy
+DQN for a direction every `--frame-skip` frames, calls
+`pacman.set_dir(...)` and `game.update()`, and stops when `game.game_over`
+is true.  `--live-max-frames` is only a safety cap for automated tests.
+
+---
+
+## 8. Evaluation and logs
+
+`evaluate.py` runs greedy episodes and aggregates:
+
+```python
+levels_cleared = info["level"] - 1
+dots_eaten = info.get(
+    "dots_eaten",
+    levels_cleared * N_PELLETS + (N_PELLETS - info["dots_left"]),
+)
+deaths = 3 - info["lives"]
+```
+
+`info["dots_eaten"]` is the true cumulative count, including later levels
+and excluding dots that the endgame curriculum pre-removed.  The fallback
+keeps old records readable.
+
+The fixed evaluation seeds are `10000 + i`, so every generation and every
+agent sees the same ghost randomness.  That makes the numbers paired and
+comparable.
+
+`train_dqn.py` writes `metrics.csv` with one row per evaluation, including
+return, score, pellets, survival, deaths, clears and wall time.  `train.py`
+builds the same schema through `rl.report` from its per-generation
+evaluations.  `plot.py` reads it and draws mean +/- standard deviation with
+a random baseline.  `aggregate.py` reads the three `eval_dqn_seed*.json`
+files and produces a multi-seed table and bar chart.
+
+Always compare on the greedy evaluation, not on the noisy exploration
+episodes in `episodes.csv`.
+
+---
+
+## 9. Design choices and trade-offs
+
+**Full grid vs egocentric crop.**  The full 28x31 grid is simple and lets
+the network see the whole maze, which is good for level 1.  It also makes
+it easy to overfit to one level.  An egocentric crop is a reasonable later
+ablation, but the curriculum is the first defence used here.
+
+**Frame skip 4.**  A human reacts in roughly 100-200 ms; four frames is
+67 ms.  It keeps training fast.  Frame skip 2 would react faster but
+double the decisions and slow training.
+
+**Ghost directions vs frame stacking.**  Four direction one-hots per ghost
+are cheap and directly encode the next movement.  Frame stacking would
+also expose velocity but multiplies the grid channels by the stack depth
+and the buffer memory.  The direction branch is the smaller first step and
+can be transferred into an old checkpoint without changing the old policy.
+
+**Endgame curriculum vs full episodes.**  Pre-removing dots gives many
+more finishing transitions per million decisions.  Removing them from
+every episode would distort the training distribution and make the
+full-level evaluation harder to compare, so the command mixes 0..160.
+Evaluation always disables removal.
+
+**Reward scale.**  A dot is +0.2, a death is -15, a level clear is +20.
+Survival is worth about 75 dots, which is strong but not overwhelming.
+If the agent camps, increase `stay_penalty`; if it moves forever without
+eating, increase the magnitude of `dot_not_eaten_penalty` or lower
+`dot_not_eaten_grace`; if it suicide-runs, make `death_penalty` more
+negative; if it farms ghost combos, lower `ghost_score_scale` or raise
+`danger_penalty`; if it refuses to finish the last pellets, raise
+`level_clear_bonus` or increase `dots_removed_max`.
+
+**Stay penalty.**  Position displacement is the right test because the
+game's `moving` flag is only refreshed at tile centres.  The penalty is
+per decision and terminal frames are exempt.
+
+**Seeds.**  A single run is an anecdote.  `run_experiments.sh` trains
+three seeds and evaluates each on 30 fixed seeds.  Report mean and
+standard deviation, not one lucky live game.
+
+---
+
+## 10. Why Q-learning is not in the code
+
+The Q-learning implementation was removed rather than kept as a dormant
+branch.  It used a hand-designed local state, could not see the full maze
+or all four ghosts, and its Python-dict table scaled poorly.  In the
+earlier experiments it also scored lower than DQN despite much cheaper
+training.  The final system deliberately exposes one algorithm so there is
+one code path to test and document.  The short notice is repeated in
+`REPORT.md` and `README.md`.
+
+---
+
+## 11. Extending to PPO / actor-critic
+
+The environment, observation, reward and evaluation code are
+algorithm-agnostic.  To add PPO later:
+
+1. Add a policy network with two heads: action logits and state value.
+2. Collect a rollout of N decisions, storing `obs`, `action`, `log_prob`,
+   `value`, `reward`, `done`, `truncated`.
+3. Compute returns and advantages with GAE(lambda).
+4. Optimise the clipped surrogate objective plus value loss and an
+   entropy bonus.
+5. Keep the same `evaluate()` and `watch.py` interfaces.
+
+A2C is the same idea with a shorter rollout and no clipped update.

@@ -38,27 +38,181 @@ Keyboard control is a debug option. Set `HUMAN=False` in `game.py` to ignore the
 ## Reinforcement learning
 
 The game is wrapped as a Gym-style environment in `rl/`.  The single-file
-entry point trains a DQN (or the tabular Q-learning baseline) from
-scratch, records a 100,000-frame training timelapse GIF, evaluates the
-agent, and then opens a live game that keeps playing until all three
-lives are gone:
+entry point trains a Double/Dueling DQN from scratch, records a
+100,000-frame training timelapse GIF, evaluates the agent, and then opens
+a live game that keeps playing until all three lives are gone:
 
 ```bash
 python train.py
 # server / no display:
 python train.py --headless --no-watch
-# smaller / faster smoke test:
-python train.py --agent q --total-decisions 2000 --gif-frames 200 \
-  --eval-episodes 2 --no-watch
+# fast smoke test (not a useful policy):
+python train.py --total-decisions 2000 --generations 2 \
+  --curriculum --gif-frames 0 --eval-episodes 2 --no-watch
 ```
 
-Outputs go to `runs/train_demo/`: `dqn.pt`, `episodes.csv`, `eval.json`,
-`run.json` and `training.gif`.  The GIF is streamed through ffmpeg, so
-100,000 frames do not sit in RAM.  At the native 224x288 resolution the
-full GIF is about 300 MiB; use `--gif-width 140 --gif-height 180` for a
-smaller file, or `--gif-frames 0` to skip recording.  See `REPORT.md` for
-the Q-learning vs DQN comparison and `rl/WALKTHROUGH.md` for the
-line-by-line explanation.
+Outputs go to `runs/train_dqn/`: `dqn.pt`, `best.pt`, per-generation
+checkpoints, `episodes.csv`, `eval.json`, `run.json`, `progress.json`,
+`metrics.csv`, `summary.md`, `stats.json`, `training_showcase.png` and
+`training.gif`.  The GIF is streamed through ffmpeg, so 100,000 frames do
+not sit in RAM.  At the native 224x288 resolution the full GIF is about
+300 MiB; use `--gif-width 140 --gif-height 180` for a smaller file, or
+`--gif-frames 0` to skip recording.
+
+The latest 10M-decision curriculum run (preserved in
+`runs/train_dqn_curriculum/`) scores **2129.0 +/- 368.9** on 30 fixed seeds,
+eats **171.7 of 244 pellets**, and still clears **0 levels**.  It is better
+than the original 1M checkpoint (1981.7 +/- 368.6 on the same 30 seeds),
+but it is not a clear.  The next run therefore starts from that best
+checkpoint and adds three targeted changes: ghost-direction observations,
+an endgame dot-removal curriculum, and reward shaping that makes ghost
+chasing less dominant.
+
+The report is written automatically at the end of every run:
+
+- `summary.md` is the human-readable result table;
+- `stats.json` is the same information for scripts;
+- `training_showcase.png` is one presentation-ready six-panel figure:
+  training score, pellets and survival with greedy-evaluation markers,
+  training return, DQN loss, and greedy evaluation by generation.
+
+The old separate `training_curves*.png` and `training_episodes.png` files
+were removed.  They duplicated the same data, and the final-bars chart had
+nothing useful to compare once Q-learning was dropped.
+
+For a run created before the report existed, rebuild it with
+`python -m rl.report --run runs/train_dqn`.  The same command also works
+while a run is still training: if `run.json` is missing it reads
+`progress.json`, `eval_gen*.json` and `episodes.csv` instead.
+
+### Training longer, in generations
+
+`train.py` supports a continuous multi-generation run.  The network and
+replay buffer survive between generations; only the level cap and the
+evaluation point change.  This is the recommended shape for an overnight
+attempt at clearing the game:
+
+```bash
+PY=/home/deathslash/venvs/mlasgn/bin/python
+$PY train.py \
+  --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
+  --generations 10 --total-decisions 20000000 \
+  --curriculum --curriculum-max-level 4 \
+  --max-frames 60000 --width 64 --train-every 1 --gamma 0.997 \
+  --batch-size 128 --replay-size 150000 \
+  --epsilon-decay 3000000 --epsilon-end 0.01 --reset-epsilon \
+  --lr-final 5e-6 --eval-episodes 30 --eval-level-cap 0 \
+  --ghost-score-scale 0.35 --danger-penalty 0.03 --danger-radius 5 \
+  --death-penalty -20 --level-clear-bonus 30 \
+  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
+  --dot-not-eaten-grace 30 \
+  --dots-removed-min 0 --dots-removed-max 160 \
+  --gif-frames 100000 --out runs/train_dqn_final
+```
+
+What the important flags mean:
+
+| Flag | Effect |
+| --- | --- |
+| `--generations N` | Split the decision budget into N evaluation/checkpoint stages |
+| `--resume` | Continue from `<out>/dqn.pt` in the same directory |
+| `--resume-from PATH` | Continue from an explicit checkpoint, e.g. into a new output directory |
+| `--partial-load` | Transfer compatible weights from an older architecture; new ghost-direction columns start at zero so the old policy is preserved exactly |
+| `--start-generation G` | With `--resume`, continue at generation G; omit it to auto-detect the next generation |
+| `--curriculum` | Generation 1 is capped at level 1, generation 2 at level 2, ... Every episode still starts at level 1; the cap only decides when it ends |
+| `--curriculum-max-level K` | After level K, later generations play the full game |
+| `--dots-removed-min/max` | Endgame curriculum: each training episode starts with a random number of ordinary dots already gone (power pellets stay) |
+| `--danger-penalty`, `--danger-radius` | Small per-decision penalty for being close to a dangerous ghost; gives a gradient before the death penalty |
+| `--ghost-score-scale` | Scales only the ghost-combo score reward; 0.5 halves it, 0.35 makes risky chasing much less attractive |
+| `--eval-level-cap 0` | Evaluate every generation on the full game, not just the training cap |
+| `--train-every 1` | One gradient update per decision (stronger, about 2x slower) |
+| `--gamma 0.997` | Longer horizon: values pellets and survival further into the future |
+| `--lr-final` | Linearly decay Adam's learning rate over the run |
+| `--epsilon-decay` | Spend longer exploring; important for a multi-million-decision run |
+| `--reset-epsilon` | When resuming, restart exploration at 1.0 instead of keeping the checkpoint's low epsilon |
+| `--no-ghost-dir` | Disable the 16 ghost-direction inputs (they are on by default for new runs) |
+| `--no-best` | Use the final checkpoint instead of the best evaluated one |
+| `--no-report` | Skip `metrics.csv`, `stats.json`, `summary.md` and `training_showcase.png` |
+
+The script saves `best.pt` whenever a generation's fixed-seed evaluation
+improves on `(level clears, pellets eaten, score)`, then uses that
+checkpoint for the final evaluation and live game.  A resumed checkpoint is
+evaluated first and entered as generation 0, so a continuation cannot
+regress below the policy it started from.  On a later `--resume`, an
+existing `best.json` is kept instead of being overwritten by the latest
+(possibly worse) checkpoint, and the old `eval_genN.json` rows are merged
+back into the table.  Older checkpoints are kept as `dqn_gen1.pt`,
+`dqn_gen2.pt`, etc.  `--resume` restores the network, optimizer, epsilon and
+counters from `dqn.pt`.  The replay buffer is not stored in the checkpoint,
+so it refills from new experience after a resume.
+
+### Continuing an existing run
+
+There are two ways to continue:
+
+- `--resume` loads `<out>/dqn.pt` and writes into the same directory.
+  `train.py` reads `progress.json` (or `run.json` for older runs) and
+  starts at the next unfinished generation, so the generation number does
+  not have to be guessed.
+- `--resume-from PATH` loads an explicit checkpoint and can write to a new
+  output directory.  This preserves the old run's `episodes.csv`,
+  `eval_gen*.json`, GIF and report while the continuation builds its own.
+
+In both cases `--total-decisions` is the budget for the remaining
+generations, not the original total.  To continue the existing level-1
+checkpoint for another 5M decisions without overwriting the old results:
+
+```bash
+PY=/home/deathslash/venvs/mlasgn/bin/python
+$PY train.py --resume-from runs/train_dqn/dqn.pt \
+  --start-generation 1 --generations 5 \
+  --total-decisions 5000000 --level-cap 1 --max-frames 18000 \
+  --width 64 --train-every 1 --gamma 0.995 \
+  --epsilon-decay 1000000 --epsilon-end 0.02 --reset-epsilon \
+  --lr-final 1e-5 --eval-episodes 30 --eval-level-cap 1 \
+  --gif-frames 0 --out runs/train_dqn_cont
+```
+
+`--reset-epsilon` restarts exploration at 1.0, which is useful when the
+first run has settled into a local policy; remove it to keep exploiting at
+the checkpoint's epsilon.  The 5-generation split gives one fixed-seed
+evaluation and checkpoint per 1M decisions, so `training_showcase.png`
+shows the continuation rather than a single evaluation point.  On a server
+add `--headless --no-watch`.
+
+If the long run above is interrupted, resume it in the same directory.
+`train.py` detects the next unfinished generation and keeps the existing
+generation 0 baseline:
+
+```bash
+$PY train.py --resume --generations 10 \
+  --total-decisions 4000000 --curriculum --curriculum-max-level 4 \
+  --max-frames 60000 --width 64 --train-every 1 --gamma 0.997 \
+  --batch-size 128 --replay-size 150000 --epsilon-decay 3000000 \
+  --epsilon-end 0.01 --lr-final 5e-6 --eval-episodes 30 \
+  --eval-level-cap 0 --ghost-score-scale 0.35 --danger-penalty 0.03 \
+  --danger-radius 5 --death-penalty -20 --level-clear-bonus 30 \
+  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
+  --dot-not-eaten-grace 30 --dots-removed-min 0 --dots-removed-max 160 \
+  --out runs/train_dqn_final
+```
+
+Both continuation styles write a fresh `summary.md`, `stats.json`,
+`metrics.csv` and `training_showcase.png` when they finish.  The old
+`runs/train_dqn` report remains available for comparison.
+
+### Why not Q-learning?
+
+Q-learning was implemented and measured, then removed from the working
+system.  It used a hand-designed local state (Pac-Man's tile, four nearby
+pellet bits, the nearest ghost, a fright bucket and the direction).  That
+cannot see the full maze or all four ghosts, and its Python-dict Q-table
+scales poorly.  In the earlier trial it scored lower than DQN despite
+being much cheaper to train.  The final project therefore ships one
+working DQN path; the full reasons are in `REPORT.md`.
+
+See `REPORT.md` for the design/results template and
+`rl/WALKTHROUGH.md` for the line-by-line explanation.
 
 ## Project layout
 
@@ -70,8 +224,8 @@ line-by-line explanation.
 | `ghost.py` | `Ghost` class: modes, targeting, movement, house walks, drawing |
 | `levels.py` | Per-level parameter table and the `params(level)` lookup |
 | `map.py` | Maze tile map, wall outlines, pellets, wall and tunnel checks |
-| `train.py` | One-file RL training, 100k-frame GIF, evaluation and live play |
-| `rl/` | Environment wrapper, observations, Q-learning, DQN, evaluation and tools |
+| `train.py` | One-file DQN training, generations/curriculum, GIF, evaluation and live play |
+| `rl/` | Environment wrapper, observations, DQN, evaluation and tools |
 
 ## Specs
 
@@ -205,7 +359,8 @@ Randomness is used in two places only: frightened ghost turns and the fruit's ti
 ## Roadmap
 
 - Gymnasium wrapper (observation, action, reward)
-- Reinforcement learning agents written from scratch: Q-learning, DQN, PPO
+- Optional DQN upgrades: prioritised replay, n-step returns
+- Optional PPO/A2C comparison using the same environment and evaluation code
 
 ## Credits and disclaimer
 

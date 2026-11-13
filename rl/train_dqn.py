@@ -18,7 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from .agents.dqn import DQNAgent
-from .config import EnvConfig, N_PELLETS
+from .config import EnvConfig, N_PELLETS, RewardConfig
 from .evaluate import evaluate
 from .pacman_env import PacmanEnv
 
@@ -30,14 +30,14 @@ METRIC_FIELDS = [
     "wall_seconds",
 ]
 EPISODE_FIELDS = [
-    "episode", "decision", "return", "score", "dots", "frames",
-    "deaths", "clears", "epsilon", "loss_mean",
+    "episode", "decision", "return", "score", "dots", "dots_removed",
+    "frames", "deaths", "clears", "epsilon", "loss_mean",
 ]
 
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--total-decisions", type=int, default=1_000_000)
+    p.add_argument("--total-decisions", type=int, default=5_000_000)
     p.add_argument("--warmup", type=int, default=5_000)
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4)
@@ -52,6 +52,18 @@ def parse_args():
     p.add_argument("--max-frames", type=int, default=18_000)
     p.add_argument("--level-cap", type=int, default=1,
                    help="stop episodes after this level; <=0 means no cap")
+    p.add_argument("--score-scale", type=float, default=None)
+    p.add_argument("--death-penalty", type=float, default=None)
+    p.add_argument("--stay-penalty", type=float, default=None)
+    p.add_argument("--dot-not-eaten-penalty", type=float, default=None)
+    p.add_argument("--dot-not-eaten-grace", type=int, default=None)
+    p.add_argument("--level-clear-bonus", type=float, default=None)
+    p.add_argument("--ghost-score-scale", type=float, default=None)
+    p.add_argument("--danger-penalty", type=float, default=None)
+    p.add_argument("--danger-radius", type=int, default=None)
+    p.add_argument("--dots-removed-min", type=int, default=0)
+    p.add_argument("--dots-removed-max", type=int, default=0)
+    p.add_argument("--no-ghost-dir", action="store_true")
     p.add_argument("--eval-every", type=int, default=50_000)
     p.add_argument("--eval-episodes", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
@@ -66,11 +78,33 @@ def main():
     out.mkdir(parents=True, exist_ok=True)
 
     level_cap = args.level_cap if args.level_cap > 0 else None
+    reward_cfg = RewardConfig()
+    if args.score_scale is not None:
+        reward_cfg.score_scale = args.score_scale
+    if args.death_penalty is not None:
+        reward_cfg.death_penalty = args.death_penalty
+    if args.stay_penalty is not None:
+        reward_cfg.stay_penalty = args.stay_penalty
+    if args.dot_not_eaten_penalty is not None:
+        reward_cfg.dot_not_eaten_penalty = args.dot_not_eaten_penalty
+    if args.dot_not_eaten_grace is not None:
+        reward_cfg.dot_not_eaten_grace = args.dot_not_eaten_grace
+    if args.level_clear_bonus is not None:
+        reward_cfg.level_clear_bonus = args.level_clear_bonus
+    if args.ghost_score_scale is not None:
+        reward_cfg.ghost_score_scale = args.ghost_score_scale
+    if args.danger_penalty is not None:
+        reward_cfg.danger_penalty = args.danger_penalty
+    if args.danger_radius is not None:
+        reward_cfg.danger_radius = args.danger_radius
     cfg = EnvConfig(
         frame_skip=args.frame_skip,
         max_frames=args.max_frames,
         level_cap=level_cap,
         seed=args.seed,
+        dots_removed_min=args.dots_removed_min,
+        dots_removed_max=args.dots_removed_max,
+        reward=reward_cfg,
     )
     env = PacmanEnv(cfg)
     agent = DQNAgent(
@@ -84,6 +118,7 @@ def main():
         replay_size=args.replay_size,
         width=args.width,
         seed=args.seed,
+        use_ghost_dir=not args.no_ghost_dir,
     )
     print(f"device: {agent.device}")
     rng = random.Random(args.seed)
@@ -127,7 +162,10 @@ def main():
         if done:
             episode += 1
             levels_cleared = info["level"] - 1
-            dots = levels_cleared * N_PELLETS + (N_PELLETS - info["dots_left"])
+            dots = info.get(
+                "dots_eaten",
+                levels_cleared * N_PELLETS + (N_PELLETS - info["dots_left"]),
+            )
             loss_mean = float(np.mean(episode_losses)) if episode_losses else 0.0
             episodes_writer.writerow({
                 "episode": episode,
@@ -135,6 +173,7 @@ def main():
                 "return": round(episode_return, 4),
                 "score": info["score"],
                 "dots": dots,
+                "dots_removed": info.get("dots_removed", 0),
                 "frames": info["frames"],
                 "deaths": 3 - info["lives"],
                 "clears": levels_cleared,
@@ -144,8 +183,18 @@ def main():
             episodes_file.flush()
 
             if decision >= next_eval:
-                result = evaluate(env, greedy_action, episodes=args.eval_episodes,
-                                  seed0=10_000)
+                old_min = env.cfg.dots_removed_min
+                old_max = env.cfg.dots_removed_max
+                env.cfg.dots_removed_min = 0
+                env.cfg.dots_removed_max = 0
+                try:
+                    result = evaluate(
+                        env, greedy_action,
+                        episodes=args.eval_episodes, seed0=10_000,
+                    )
+                finally:
+                    env.cfg.dots_removed_min = old_min
+                    env.cfg.dots_removed_max = old_max
                 elapsed = time.perf_counter() - started
                 row = {
                     "decision": decision,

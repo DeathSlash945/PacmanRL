@@ -33,6 +33,7 @@ class DQNAgent:
         grad_clip=10.0,
         width=64,
         seed=0,
+        use_ghost_dir=False,
     ):
         self.device = torch.device(
             device if device is not None
@@ -47,16 +48,28 @@ class DQNAgent:
         self.target_update = target_update
         self.grad_clip = grad_clip
         self.rng = random.Random(seed)
+        self.width = int(width)
+        self.lr = float(lr)
+        self.use_ghost_dir = bool(use_ghost_dir)
 
-        self.online = QNetwork(width=width).to(self.device)
-        self.target = QNetwork(width=width).to(self.device)
-        self.target.load_state_dict(self.online.state_dict())
-        self.target.eval()
-        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=lr)
         self.buffer = ReplayBuffer(replay_size, seed=seed)
+        self._build_networks()
 
         self.decisions = 0
         self.updates = 0
+        self.loaded_partial = False
+
+    def _build_networks(self):
+        """(Re)create the online/target nets for the current architecture."""
+        self.online = QNetwork(
+            width=self.width, use_ghost_dir=self.use_ghost_dir
+        ).to(self.device)
+        self.target = QNetwork(
+            width=self.width, use_ghost_dir=self.use_ghost_dir
+        ).to(self.device)
+        self.target.load_state_dict(self.online.state_dict())
+        self.target.eval()
+        self.optimizer = torch.optim.Adam(self.online.parameters(), lr=self.lr)
 
     def act(self, obs, greedy=False):
         if not greedy and self.rng.random() < self.epsilon:
@@ -64,8 +77,16 @@ class DQNAgent:
 
         grid = torch.from_numpy(obs["grid"]).float().unsqueeze(0).to(self.device)
         vec = torch.from_numpy(obs["vec"]).float().unsqueeze(0).to(self.device)
+        ghost_dir = None
+        if self.use_ghost_dir:
+            ghost_dir = (
+                torch.from_numpy(obs["ghost_dir"])
+                .float()
+                .unsqueeze(0)
+                .to(self.device)
+            )
         with torch.no_grad():
-            q = self.online(grid, vec)
+            q = self.online(grid, vec, ghost_dir)
         return int(q.argmax(dim=1).item())
 
     def update_epsilon(self):
@@ -83,18 +104,29 @@ class DQNAgent:
         batch = self.buffer.sample(self.batch_size)
         grid = batch["grid"].to(self.device).float() / 2.0
         vec = batch["vec"].to(self.device)
+        ghost_dir = None
+        next_ghost_dir = None
+        if self.use_ghost_dir:
+            ghost_dir = batch["ghost_dir"].to(self.device).float()
+            next_ghost_dir = batch["next_ghost_dir"].to(self.device).float()
         action = batch["action"].to(self.device)
         reward = batch["reward"].to(self.device)
         next_grid = batch["next_grid"].to(self.device).float() / 2.0
         next_vec = batch["next_vec"].to(self.device)
         terminal = batch["terminal"].to(self.device)
 
-        q = self.online(grid, vec).gather(1, action.unsqueeze(1)).squeeze(1)
+        q = self.online(grid, vec, ghost_dir).gather(
+            1, action.unsqueeze(1)
+        ).squeeze(1)
 
         with torch.no_grad():
             # Double DQN: online net picks the action, target net scores it.
-            next_actions = self.online(next_grid, next_vec).argmax(dim=1, keepdim=True)
-            next_q = self.target(next_grid, next_vec).gather(1, next_actions).squeeze(1)
+            next_actions = self.online(
+                next_grid, next_vec, next_ghost_dir
+            ).argmax(dim=1, keepdim=True)
+            next_q = self.target(
+                next_grid, next_vec, next_ghost_dir
+            ).gather(1, next_actions).squeeze(1)
             target = reward + self.gamma * next_q * (1.0 - terminal)
 
         loss = F.smooth_l1_loss(q, target)
@@ -119,15 +151,90 @@ class DQNAgent:
                 "decisions": self.decisions,
                 "updates": self.updates,
                 "epsilon": self.epsilon,
+                "use_ghost_dir": self.use_ghost_dir,
+                "width": self.width,
+                "lr": self.lr,
+                "architecture": 2,
             },
             path,
         )
 
-    def load(self, path):
+    def _load_matching(self, module, state, checkpoint_width):
+        """Load every compatible tensor, including a resized trunk input.
+
+        When a checkpoint predates the ghost-direction branch, the only
+        shape mismatch is ``trunk.0.weight``: it has VEC_DIM fewer input
+        columns.  Copy the old columns and zero the new ones, so the old
+        policy is initially preserved exactly.  The ghost branch can then
+        learn on top of it.
+        """
+        own = module.state_dict()
+        for key, value in state.items():
+            if key not in own:
+                continue
+            if own[key].shape == value.shape:
+                own[key] = value
+                continue
+            if (
+                key.endswith("trunk.0.weight")
+                and own[key].dim() == 2
+                and value.dim() == 2
+                and int(checkpoint_width) == self.width
+            ):
+                merged = own[key].clone()
+                rows = min(merged.shape[0], value.shape[0])
+                cols = min(merged.shape[1], value.shape[1])
+                merged[:rows, :cols] = value[:rows, :cols]
+                if cols < merged.shape[1]:
+                    merged[:, cols:] = 0.0
+                own[key] = merged
+        module.load_state_dict(own)
+
+    def load(self, path, allow_partial=False):
         checkpoint = torch.load(path, map_location=self.device)
-        self.online.load_state_dict(checkpoint["online"])
-        self.target.load_state_dict(checkpoint["target"])
-        self.optimizer.load_state_dict(checkpoint["optimizer"])
+        online_state = checkpoint["online"]
+        target_state = checkpoint.get("target", online_state)
+
+        checkpoint_use = bool(checkpoint.get("use_ghost_dir", False))
+        checkpoint_width = checkpoint.get("width")
+        if checkpoint_width is None:
+            weight = online_state.get("conv.4.weight")
+            checkpoint_width = (
+                int(weight.shape[0]) if weight is not None else self.width
+            )
+        checkpoint_width = int(checkpoint_width)
+
+        same_arch = (
+            checkpoint_use == self.use_ghost_dir
+            and checkpoint_width == self.width
+        )
+
+        if not same_arch and not allow_partial:
+            # Evaluating an old checkpoint should just work, even though
+            # the caller did not know which observation version it used.
+            self.use_ghost_dir = checkpoint_use
+            self.width = checkpoint_width
+            self._build_networks()
+            same_arch = True
+
+        if same_arch:
+            self.online.load_state_dict(online_state)
+            self.target.load_state_dict(target_state)
+            optimizer_state = checkpoint.get("optimizer")
+            if optimizer_state is not None:
+                try:
+                    self.optimizer.load_state_dict(optimizer_state)
+                except (ValueError, KeyError):
+                    # A fresh optimizer is safer than a mismatched one.
+                    pass
+            self.loaded_partial = False
+        else:
+            # Transfer what is architecturally compatible (all convolutions,
+            # both dueling heads, and the old part of the trunk input).
+            self._load_matching(self.online, online_state, checkpoint_width)
+            self._load_matching(self.target, target_state, checkpoint_width)
+            self.loaded_partial = True
+
         self.decisions = checkpoint.get("decisions", 0)
         self.updates = checkpoint.get("updates", 0)
         self.epsilon = checkpoint.get("epsilon", self.epsilon_end)

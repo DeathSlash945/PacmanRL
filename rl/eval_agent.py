@@ -1,8 +1,9 @@
-"""Evaluate a saved agent on fixed seeds and print/save the metrics.
+"""Evaluate a saved DQN agent on fixed seeds and print/save the metrics.
 
 Examples:
-    python -m rl.eval_agent --agent q  --checkpoint runs/qlearning/q.pkl
-    python -m rl.eval_agent --agent dqn --checkpoint runs/dqn/dqn.pt --width 32
+    python -m rl.eval_agent --agent dqn --checkpoint runs/dqn/dqn.pt
+    python -m rl.eval_agent --agent dqn --checkpoint runs/dqn/best.pt \
+        --width 64 --level-cap 0
     python -m rl.eval_agent --agent random
 """
 
@@ -12,7 +13,6 @@ import random
 from pathlib import Path
 
 from .agents.dqn import DQNAgent
-from .agents.qlearning import QLearningAgent
 from .config import EnvConfig
 from .evaluate import run_episode
 from .pacman_env import PacmanEnv
@@ -20,14 +20,15 @@ from .pacman_env import PacmanEnv
 
 def parse_args():
     p = argparse.ArgumentParser()
-    p.add_argument("--agent", choices=("q", "dqn", "random"), required=True)
+    p.add_argument("--agent", choices=("dqn", "random"), required=True)
     p.add_argument("--checkpoint", type=str, default=None)
     p.add_argument("--episodes", type=int, default=30)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--frame-skip", type=int, default=4)
     p.add_argument("--max-frames", type=int, default=18_000)
-    p.add_argument("--level-cap", type=int, default=1)
-    p.add_argument("--width", type=int, default=32)
+    p.add_argument("--level-cap", type=int, default=1,
+                   help="stop after this level; 0 evaluates the full game")
+    p.add_argument("--width", type=int, default=64)
     p.add_argument("--device", type=str, default=None)
     p.add_argument("--out", type=str, default=None)
     return p.parse_args()
@@ -47,12 +48,6 @@ def main():
         rng = random.Random(args.seed)
         act_fn = lambda _obs: rng.randrange(4)
         label = "random"
-    elif args.agent == "q":
-        if not args.checkpoint:
-            raise SystemExit("--checkpoint is required for --agent q")
-        agent = QLearningAgent.load(args.checkpoint)
-        act_fn = lambda _obs: agent.act(agent.state_from_game(env.game), greedy=True)
-        label = "q"
     else:
         if not args.checkpoint:
             raise SystemExit("--checkpoint is required for --agent dqn")
