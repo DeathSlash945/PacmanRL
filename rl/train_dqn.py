@@ -18,6 +18,7 @@ from pathlib import Path
 import numpy as np
 
 from .agents.dqn import DQNAgent
+from .buffer import NStepAccumulator
 from .config import EnvConfig, N_PELLETS, RewardConfig
 from .evaluate import evaluate
 from .pacman_env import PacmanEnv
@@ -42,11 +43,13 @@ def parse_args():
     p.add_argument("--batch-size", type=int, default=64)
     p.add_argument("--lr", type=float, default=1e-4)
     p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--epsilon-start", type=float, default=1.0)
     p.add_argument("--epsilon-end", type=float, default=0.05)
     p.add_argument("--epsilon-decay", type=int, default=200_000)
     p.add_argument("--target-update", type=int, default=2_000)
     p.add_argument("--replay-size", type=int, default=100_000)
     p.add_argument("--train-every", type=int, default=2)
+    p.add_argument("--n-step", type=int, default=1)
     p.add_argument("--width", type=int, default=64)
     p.add_argument("--frame-skip", type=int, default=4)
     p.add_argument("--max-frames", type=int, default=18_000)
@@ -54,6 +57,7 @@ def parse_args():
                    help="stop episodes after this level; <=0 means no cap")
     p.add_argument("--score-scale", type=float, default=None)
     p.add_argument("--death-penalty", type=float, default=None)
+    p.add_argument("--step-penalty", type=float, default=None)
     p.add_argument("--stay-penalty", type=float, default=None)
     p.add_argument("--dot-not-eaten-penalty", type=float, default=None)
     p.add_argument("--dot-not-eaten-grace", type=int, default=None)
@@ -64,6 +68,7 @@ def parse_args():
     p.add_argument("--dots-removed-min", type=int, default=0)
     p.add_argument("--dots-removed-max", type=int, default=0)
     p.add_argument("--no-ghost-dir", action="store_true")
+    p.add_argument("--no-amp", action="store_true")
     p.add_argument("--eval-every", type=int, default=50_000)
     p.add_argument("--eval-episodes", type=int, default=10)
     p.add_argument("--seed", type=int, default=0)
@@ -74,6 +79,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    if args.n_step <= 0:
+        raise SystemExit("--n-step must be positive")
+    if args.train_every <= 0:
+        raise SystemExit("--train-every must be positive")
     out = Path(args.out)
     out.mkdir(parents=True, exist_ok=True)
 
@@ -83,6 +92,8 @@ def main():
         reward_cfg.score_scale = args.score_scale
     if args.death_penalty is not None:
         reward_cfg.death_penalty = args.death_penalty
+    if args.step_penalty is not None:
+        reward_cfg.step_penalty = args.step_penalty
     if args.stay_penalty is not None:
         reward_cfg.stay_penalty = args.stay_penalty
     if args.dot_not_eaten_penalty is not None:
@@ -112,6 +123,7 @@ def main():
         lr=args.lr,
         gamma=args.gamma,
         batch_size=args.batch_size,
+        epsilon_start=args.epsilon_start,
         epsilon_end=args.epsilon_end,
         epsilon_decay=args.epsilon_decay,
         target_update=args.target_update,
@@ -119,9 +131,12 @@ def main():
         width=args.width,
         seed=args.seed,
         use_ghost_dir=not args.no_ghost_dir,
+        use_amp=not args.no_amp,
     )
-    print(f"device: {agent.device}")
+    print(f"device: {agent.device} | AMP: "
+          f"{agent.amp_dtype if agent.use_amp else 'off'}")
     rng = random.Random(args.seed)
+    nstep = NStepAccumulator(args.n_step, agent.gamma, agent.remember)
 
     metrics_file = open(out / "metrics.csv", "w", newline="")
     episodes_file = open(out / "episodes.csv", "w", newline="")
@@ -148,7 +163,7 @@ def main():
 
         next_obs, reward, done, info = env.step(action)
         terminal = done and not info["truncated"]
-        agent.remember(obs, action, reward, next_obs, terminal)
+        nstep.add(obs, action, reward, next_obs, terminal)
         agent.update_epsilon()
 
         if decision > args.warmup and decision % args.train_every == 0:
@@ -160,6 +175,7 @@ def main():
         episode_return += reward
 
         if done:
+            nstep.flush()
             episode += 1
             levels_cleared = info["level"] - 1
             dots = info.get(

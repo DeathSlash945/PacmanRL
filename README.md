@@ -96,19 +96,55 @@ attempt at clearing the game:
 PY=/home/deathslash/venvs/mlasgn/bin/python
 $PY train.py \
   --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
-  --generations 10 --total-decisions 20000000 \
+  --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
+  --generations 10 --total-decisions 10000000 \
   --curriculum --curriculum-max-level 4 \
-  --max-frames 60000 --width 64 --train-every 1 --gamma 0.997 \
-  --batch-size 128 --replay-size 150000 \
-  --epsilon-decay 3000000 --epsilon-end 0.01 --reset-epsilon \
-  --lr-final 5e-6 --eval-episodes 30 --eval-level-cap 0 \
-  --ghost-score-scale 0.35 --danger-penalty 0.03 --danger-radius 5 \
-  --death-penalty -20 --level-clear-bonus 30 \
-  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
-  --dot-not-eaten-grace 30 \
-  --dots-removed-min 0 --dots-removed-max 160 \
-  --gif-frames 100000 --out runs/train_dqn_final
+  --max-frames 60000 --width 64 \
+  --n-step 3 --train-every 2 --batch-size 256 --target-update 1000 \
+  --gamma 0.995 --replay-size 150000 \
+  --epsilon-start 0.1 --reset-epsilon \
+  --epsilon-decay 3000000 --epsilon-end 0.01 \
+  --lr 3e-5 --lr-final 1e-6 --eval-episodes 30 --eval-level-cap 0 \
+  --ghost-score-scale 0.5 --danger-penalty 0.02 --danger-radius 5 \
+  --death-penalty -20 --level-clear-bonus 50 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --dots-removed-min 0 --dots-removed-max 120 \
+  --gif-frames 0 --out runs/train_dqn_finetune
 ```
+
+This is a **fine-tuning** run, not a fresh from-scratch run.  The earlier
+`runs/train_dqn_final` experiment reset epsilon to 1.0, changed gamma to
+0.997 and used aggressive shaping; after 8M decisions its best generation
+was still the 2129-point starting checkpoint (generation 8 reached only
+1157.0 score and 101.7 pellets).  The recipe above keeps the old policy
+alive with three changes: 100k warm-start transitions from the loaded
+policy, a gentle epsilon reset to 0.1, and a lower Adam learning rate.
+It also uses n-step returns (3), a larger batch with one update every two
+decisions, and AMP, so the GPU does useful work and the run should finish
+substantially faster than the previous 10M run.  A 20k-decision benchmark
+on this machine measured about 189 decisions/s for the old
+batch-128/every-decision/no-AMP loop and 261 decisions/s for the new
+batch-256/every-two-decisions/bf16 loop, roughly 1.4x faster.  GIF capture
+is off in the command, which removes another source of overhead.  `--gif-frames 0` skips
+recording; the existing 100k-frame GIF remains in `runs/train_dqn`.  To
+record a fresh demo after training, use
+`python -m rl.record --agent dqn --checkpoint runs/train_dqn_finetune/best.pt
+--out runs/train_dqn_finetune/demo.gif --frames 6000`.
+
+
+If you want more than one candidate per wall-clock hour, launch two or
+three independent fine-tunes in parallel.  They share the GPU and use
+different CPU cores; each writes its own run directory, so you can compare
+`eval.json` afterwards:
+
+```bash
+scripts/train_parallel.sh 3 10000000   # 3 candidates, 10M decisions each
+```
+
+The helper disables the GIF and live window for candidates, uses the same
+fine-tuning recipe, and varies `ghost_score_scale`, `danger_penalty` and the
+endgame dot range so the runs are not identical.
 
 What the important flags mean:
 
@@ -123,15 +159,22 @@ What the important flags mean:
 | `--curriculum-max-level K` | After level K, later generations play the full game |
 | `--dots-removed-min/max` | Endgame curriculum: each training episode starts with a random number of ordinary dots already gone (power pellets stay) |
 | `--danger-penalty`, `--danger-radius` | Small per-decision penalty for being close to a dangerous ghost; gives a gradient before the death penalty |
+| `--step-penalty` | Per-decision movement cost; the default is -0.005, small enough that 20 moves still cost less than one dot |
 | `--ghost-score-scale` | Scales only the ghost-combo score reward; 0.5 halves it, 0.35 makes risky chasing much less attractive |
 | `--eval-level-cap 0` | Evaluate every generation on the full game, not just the training cap |
-| `--train-every 1` | One gradient update per decision (stronger, about 2x slower) |
-| `--gamma 0.997` | Longer horizon: values pellets and survival further into the future |
-| `--lr-final` | Linearly decay Adam's learning rate over the run |
+| `--warmstart-buffer N` | On resume, fill the replay buffer with N decisions from the loaded policy before any gradient step; the cheapest defence against catastrophic forgetting |
+| `--warmstart-epsilon` | Exploration used only while filling that buffer (0.05 is enough) |
+| `--epsilon-start` | Starting epsilon for a fresh run or `--reset-epsilon`; use 0.1 to fine-tune, not 1.0 |
+| `--n-step N` | Store N-step returns (3 is a good compromise); gives sparse deaths and clears a shorter credit path |
+| `--train-every N` + `--batch-size M` | Fewer, larger GPU updates.  2/256 has the same samples per decision as 1/128 but much better GPU utilisation |
+| `--gamma 0.995` | Keep the checkpoint's horizon when fine-tuning; changing gamma changes every Q-target |
+| `--lr`, `--lr-final` | Fine-tune with `3e-5 -> 1e-6`, not the fresh-run `1e-4` |
 | `--epsilon-decay` | Spend longer exploring; important for a multi-million-decision run |
-| `--reset-epsilon` | When resuming, restart exploration at 1.0 instead of keeping the checkpoint's low epsilon |
+| `--reset-epsilon` | When resuming, restart exploration from `--epsilon-start` instead of keeping the checkpoint's low epsilon |
+| `--no-amp` | Disable CUDA mixed precision (AMP is on by default and roughly 1.5x faster) |
 | `--no-ghost-dir` | Disable the 16 ghost-direction inputs (they are on by default for new runs) |
 | `--no-best` | Use the final checkpoint instead of the best evaluated one |
+| `--no-live` | Skip the final live game; useful for background or parallel candidates |
 | `--no-report` | Skip `metrics.csv`, `stats.json`, `summary.md` and `training_showcase.png` |
 
 The script saves `best.pt` whenever a generation's fixed-seed evaluation
@@ -144,7 +187,9 @@ existing `best.json` is kept instead of being overwritten by the latest
 back into the table.  Older checkpoints are kept as `dqn_gen1.pt`,
 `dqn_gen2.pt`, etc.  `--resume` restores the network, optimizer, epsilon and
 counters from `dqn.pt`.  The replay buffer is not stored in the checkpoint,
-so it refills from new experience after a resume.
+so it refills from new experience after a resume.  Pass
+`--warmstart-buffer 100000` to fill it from the loaded policy first; without
+that, the first gradient steps can wash out a good policy.
 
 ### Continuing an existing run
 
@@ -167,15 +212,20 @@ PY=/home/deathslash/venvs/mlasgn/bin/python
 $PY train.py --resume-from runs/train_dqn/dqn.pt \
   --start-generation 1 --generations 5 \
   --total-decisions 5000000 --level-cap 1 --max-frames 18000 \
-  --width 64 --train-every 1 --gamma 0.995 \
-  --epsilon-decay 1000000 --epsilon-end 0.02 --reset-epsilon \
-  --lr-final 1e-5 --eval-episodes 30 --eval-level-cap 1 \
+  --width 64 --train-every 2 --batch-size 256 --n-step 3 --gamma 0.995 \
+  --warmstart-buffer 50000 --warmstart-epsilon 0.05 \
+  --epsilon-start 0.1 --reset-epsilon --epsilon-decay 1000000 \
+  --epsilon-end 0.02 --lr 3e-5 --lr-final 1e-6 \
+  --eval-episodes 30 --eval-level-cap 1 \
   --gif-frames 0 --out runs/train_dqn_cont
 ```
 
-`--reset-epsilon` restarts exploration at 1.0, which is useful when the
-first run has settled into a local policy; remove it to keep exploiting at
-the checkpoint's epsilon.  The 5-generation split gives one fixed-seed
+`--reset-epsilon` now restarts exploration from `--epsilon-start` (0.1 in
+this example), not from 1.0.  A full reset to 1.0 is still available with
+`--epsilon-start 1.0`, but it should only be used for a genuine fresh
+policy; on a fine-tune it usually destroys the checkpoint before the new
+reward signal can take effect.  Remove `--reset-epsilon` entirely to keep
+the checkpoint's epsilon and decay counter.  The 5-generation split gives one fixed-seed
 evaluation and checkpoint per 1M decisions, so `training_showcase.png`
 shows the continuation rather than a single evaluation point.  On a server
 add `--headless --no-watch`.
@@ -187,14 +237,17 @@ generation 0 baseline:
 ```bash
 $PY train.py --resume --generations 10 \
   --total-decisions 4000000 --curriculum --curriculum-max-level 4 \
-  --max-frames 60000 --width 64 --train-every 1 --gamma 0.997 \
-  --batch-size 128 --replay-size 150000 --epsilon-decay 3000000 \
-  --epsilon-end 0.01 --lr-final 5e-6 --eval-episodes 30 \
-  --eval-level-cap 0 --ghost-score-scale 0.35 --danger-penalty 0.03 \
-  --danger-radius 5 --death-penalty -20 --level-clear-bonus 30 \
-  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
-  --dot-not-eaten-grace 30 --dots-removed-min 0 --dots-removed-max 160 \
-  --out runs/train_dqn_final
+  --max-frames 60000 --width 64 --n-step 3 --train-every 2 \
+  --batch-size 256 --target-update 1000 --gamma 0.995 \
+  --replay-size 150000 --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
+  --epsilon-start 0.1 --reset-epsilon --epsilon-decay 3000000 \
+  --epsilon-end 0.01 --lr 3e-5 --lr-final 1e-6 --eval-episodes 30 \
+  --eval-level-cap 0 --ghost-score-scale 0.5 --danger-penalty 0.02 \
+  --danger-radius 5 --death-penalty -20 --level-clear-bonus 50 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --dots-removed-min 0 --dots-removed-max 120 \
+  --out runs/train_dqn_finetune
 ```
 
 Both continuation styles write a fresh `summary.md`, `stats.json`,
@@ -359,7 +412,7 @@ Randomness is used in two places only: frightened ghost turns and the fruit's ti
 ## Roadmap
 
 - Gymnasium wrapper (observation, action, reward)
-- Optional DQN upgrades: prioritised replay, n-step returns
+- Optional DQN upgrades: prioritised replay and a distributional head
 - Optional PPO/A2C comparison using the same environment and evaluation code
 
 ## Credits and disclaimer

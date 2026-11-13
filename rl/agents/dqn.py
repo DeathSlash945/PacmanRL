@@ -34,6 +34,7 @@ class DQNAgent:
         width=64,
         seed=0,
         use_ghost_dir=False,
+        use_amp=True,
     ):
         self.device = torch.device(
             device if device is not None
@@ -51,6 +52,24 @@ class DQNAgent:
         self.width = int(width)
         self.lr = float(lr)
         self.use_ghost_dir = bool(use_ghost_dir)
+
+        # Mixed precision is a pure speed optimisation: weights and the
+        # optimizer stay in float32, while the convolutions and matmuls run
+        # in bf16/fp16.  bf16 needs no gradient scaler and has the same
+        # exponent range as fp32, so it is the safer default on Ampere+.
+        self.use_amp = bool(use_amp) and self.device.type == "cuda"
+        self.amp_dtype = torch.float16
+        if self.use_amp:
+            self.amp_dtype = (
+                torch.bfloat16
+                if torch.cuda.is_bf16_supported()
+                else torch.float16
+            )
+            torch.backends.cudnn.benchmark = True
+        self.scaler = torch.amp.GradScaler(
+            "cuda",
+            enabled=self.use_amp and self.amp_dtype == torch.float16,
+        )
 
         self.buffer = ReplayBuffer(replay_size, seed=seed)
         self._build_networks()
@@ -85,7 +104,11 @@ class DQNAgent:
                 .unsqueeze(0)
                 .to(self.device)
             )
-        with torch.no_grad():
+        with torch.inference_mode(), torch.autocast(
+            device_type=self.device.type,
+            dtype=self.amp_dtype,
+            enabled=self.use_amp,
+        ):
             q = self.online(grid, vec, ghost_dir)
         return int(q.argmax(dim=1).item())
 
@@ -115,26 +138,40 @@ class DQNAgent:
         next_vec = batch["next_vec"].to(self.device)
         terminal = batch["terminal"].to(self.device)
 
-        q = self.online(grid, vec, ghost_dir).gather(
-            1, action.unsqueeze(1)
-        ).squeeze(1)
+        with torch.autocast(
+            device_type=self.device.type,
+            dtype=self.amp_dtype,
+            enabled=self.use_amp,
+        ):
+            q = self.online(grid, vec, ghost_dir).gather(
+                1, action.unsqueeze(1)
+            ).squeeze(1)
 
-        with torch.no_grad():
-            # Double DQN: online net picks the action, target net scores it.
-            next_actions = self.online(
-                next_grid, next_vec, next_ghost_dir
-            ).argmax(dim=1, keepdim=True)
-            next_q = self.target(
-                next_grid, next_vec, next_ghost_dir
-            ).gather(1, next_actions).squeeze(1)
-            target = reward + self.gamma * next_q * (1.0 - terminal)
+            with torch.no_grad():
+                # Double DQN: online net picks the action, target net scores it.
+                next_actions = self.online(
+                    next_grid, next_vec, next_ghost_dir
+                ).argmax(dim=1, keepdim=True)
+                next_q = self.target(
+                    next_grid, next_vec, next_ghost_dir
+                ).gather(1, next_actions).squeeze(1)
+                target = reward + self.gamma * next_q * (1.0 - terminal)
 
-        loss = F.smooth_l1_loss(q, target)
+            # The loss itself is computed in float32 so a rare large target
+            # cannot overflow the reduced-precision forward pass.
+            loss = F.smooth_l1_loss(q.float(), target.float())
 
         self.optimizer.zero_grad(set_to_none=True)
-        loss.backward()
-        nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
-        self.optimizer.step()
+        if self.scaler.is_enabled():
+            self.scaler.scale(loss).backward()
+            self.scaler.unscale_(self.optimizer)
+            nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
+            self.scaler.step(self.optimizer)
+            self.scaler.update()
+        else:
+            loss.backward()
+            nn.utils.clip_grad_norm_(self.online.parameters(), self.grad_clip)
+            self.optimizer.step()
 
         self.updates += 1
         if self.updates % self.target_update == 0:

@@ -94,6 +94,7 @@ import pygame as pg
 import map as maze
 from env import Game
 from rl.agents.dqn import DQNAgent
+from rl.buffer import NStepAccumulator
 from rl.config import ACTIONS, EnvConfig, N_PELLETS, RewardConfig
 from rl.evaluate import evaluate
 from rl.obs import ObservationBuilder
@@ -125,6 +126,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--frame-skip must be positive")
     if args.train_every <= 0:
         raise SystemExit("--train-every must be positive")
+    if args.n_step <= 0:
+        raise SystemExit("--n-step must be positive")
     if args.log_every <= 0:
         raise SystemExit("--log-every must be positive")
     if args.live_fps <= 0:
@@ -133,6 +136,14 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--width must be positive")
     if args.epsilon_decay <= 0:
         raise SystemExit("--epsilon-decay must be positive")
+    if not 0.0 <= args.epsilon_start <= 1.0:
+        raise SystemExit("--epsilon-start must be between 0 and 1")
+    if not 0.0 <= args.epsilon_end <= 1.0:
+        raise SystemExit("--epsilon-end must be between 0 and 1")
+    if args.warmstart_buffer < 0:
+        raise SystemExit("--warmstart-buffer cannot be negative")
+    if not 0.0 <= args.warmstart_epsilon <= 1.0:
+        raise SystemExit("--warmstart-epsilon must be between 0 and 1")
     if args.lr_final is not None and args.lr_final <= 0:
         raise SystemExit("--lr-final must be positive")
     if args.eval_episodes < 0:
@@ -143,6 +154,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--dot-not-eaten-grace cannot be negative")
     if args.dot_not_eaten_penalty is not None and args.dot_not_eaten_penalty > 0:
         raise SystemExit("--dot-not-eaten-penalty must be zero or negative")
+    if args.step_penalty is not None and args.step_penalty > 0:
+        raise SystemExit("--step-penalty must be zero or negative")
     if args.dots_removed_min < 0 or args.dots_removed_max < 0:
         raise SystemExit("--dots-removed-min/max cannot be negative")
     if args.dots_removed_max < args.dots_removed_min:
@@ -150,11 +163,11 @@ def validate_args(args: argparse.Namespace) -> None:
     if args.dots_removed_max > 240:
         raise SystemExit("--dots-removed-max cannot exceed 240 (four power "
                          "pellets are never removed)")
-    if args.ghost_score_scale < 0:
+    if args.ghost_score_scale is not None and args.ghost_score_scale < 0:
         raise SystemExit("--ghost-score-scale cannot be negative")
-    if args.danger_penalty < 0:
+    if args.danger_penalty is not None and args.danger_penalty < 0:
         raise SystemExit("--danger-penalty cannot be negative")
-    if args.danger_radius < 0:
+    if args.danger_radius is not None and args.danger_radius < 0:
         raise SystemExit("--danger-radius cannot be negative")
 
 
@@ -187,9 +200,10 @@ def parse_args() -> argparse.Namespace:
                         "useful for continuing into a new output directory "
                         "without overwriting the old run")
     p.add_argument("--reset-epsilon", action="store_true",
-                   help="when resuming, restart epsilon decay at 1.0 for a new "
-                        "exploration phase instead of keeping the low checkpoint "
-                        "epsilon")
+                   help="when resuming, restart epsilon decay from "
+                        "--epsilon-start (default 1.0) instead of keeping the "
+                        "low checkpoint epsilon; for gentle fine-tuning use "
+                        "--reset-epsilon --epsilon-start 0.1")
     p.add_argument("--partial-load", action="store_true",
                    help="when resuming an old checkpoint into a different "
                         "observation architecture, transfer all shape-compatible "
@@ -215,6 +229,9 @@ def parse_args() -> argparse.Namespace:
                    help="override RewardConfig.score_scale; default comes from rl/config.py")
     p.add_argument("--death-penalty", type=float, default=None,
                    help="override RewardConfig.death_penalty; default comes from rl/config.py")
+    p.add_argument("--step-penalty", type=float, default=None,
+                   help="override RewardConfig.step_penalty; charged on every "
+                        "decision, so it gently pushes the agent to keep moving")
     p.add_argument("--stay-penalty", type=float, default=None,
                    help="override RewardConfig.stay_penalty; default comes from rl/config.py")
     p.add_argument("--dot-not-eaten-penalty", type=float, default=None,
@@ -249,15 +266,33 @@ def parse_args() -> argparse.Namespace:
                    help="linearly decay Adam lr from --lr to this value over "
                         "the run; omit for a constant lr")
     p.add_argument("--gamma", type=float, default=0.99)
+    p.add_argument("--epsilon-start", type=float, default=1.0,
+                   help="starting epsilon for a fresh run, and the value used "
+                        "by --reset-epsilon; set 0.1 for gentle fine-tuning")
     p.add_argument("--epsilon-end", type=float, default=0.02)
     p.add_argument("--epsilon-decay", type=int, default=500_000)
     p.add_argument("--target-update", type=int, default=2_000)
     p.add_argument("--replay-size", type=int, default=100_000)
     p.add_argument("--train-every", type=int, default=2,
                    help="one gradient step per N decisions; use 1 for the "
-                        "strongest (but slowest) long run")
+                        "strongest (but slowest) long run. Pair a larger N "
+                        "with a larger --batch-size to keep samples per "
+                        "decision and GPU utilisation high (e.g. 2/256).")
+    p.add_argument("--n-step", type=int, default=1,
+                   help="n-step return length; 1 is one-step DQN, 3 is a good "
+                        "speed/sample-efficiency compromise for sparse deaths "
+                        "and level clears")
     p.add_argument("--width", type=int, default=64,
                    help="DQN convolution width; 64 is the recommended value")
+    p.add_argument("--no-amp", action="store_true",
+                   help="disable CUDA mixed precision (AMP is on by default)")
+    p.add_argument("--warmstart-buffer", type=int, default=0,
+                   help="when resuming, fill the replay buffer with this many "
+                        "decisions from the loaded policy before training; "
+                        "this preserves the old behaviour while the new reward "
+                        "is learned (e.g. 100000)")
+    p.add_argument("--warmstart-epsilon", type=float, default=0.05,
+                   help="exploration used while filling the warm-start buffer")
 
     # Bookkeeping.
     p.add_argument("--out", type=str, default=str(ROOT / "runs" / "train_dqn"))
@@ -286,6 +321,9 @@ def parse_args() -> argparse.Namespace:
     # Final live game.
     p.add_argument("--no-watch", action="store_true",
                    help="run the final game headlessly instead of opening a window")
+    p.add_argument("--no-live", action="store_true",
+                   help="skip the final live game; useful for parallel or "
+                        "background candidates")
     p.add_argument("--headless", action="store_true",
                    help="force SDL's dummy video driver")
     p.add_argument("--live-seed", type=int, default=12_345)
@@ -611,6 +649,7 @@ def build_agent(args: argparse.Namespace) -> DQNAgent:
         lr=args.lr,
         gamma=args.gamma,
         batch_size=args.batch_size,
+        epsilon_start=args.epsilon_start,
         epsilon_end=args.epsilon_end,
         epsilon_decay=args.epsilon_decay,
         target_update=args.target_update,
@@ -618,6 +657,7 @@ def build_agent(args: argparse.Namespace) -> DQNAgent:
         width=args.width,
         seed=args.seed,
         use_ghost_dir=not args.no_ghost_dir,
+        use_amp=not args.no_amp,
     )
 
 
@@ -806,6 +846,8 @@ def train(args: argparse.Namespace) -> DQNAgent:
         reward_cfg.score_scale = args.score_scale
     if args.death_penalty is not None:
         reward_cfg.death_penalty = args.death_penalty
+    if args.step_penalty is not None:
+        reward_cfg.step_penalty = args.step_penalty
     if args.stay_penalty is not None:
         reward_cfg.stay_penalty = args.stay_penalty
     if args.dot_not_eaten_penalty is not None:
@@ -824,6 +866,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         "reward: "
         f"score_scale={reward_cfg.score_scale} "
         f"death_penalty={reward_cfg.death_penalty} "
+        f"step_penalty={reward_cfg.step_penalty} "
         f"stay_penalty={reward_cfg.stay_penalty} "
         f"dot_not_eaten_penalty={reward_cfg.dot_not_eaten_penalty} "
         f"dot_not_eaten_grace={reward_cfg.dot_not_eaten_grace} "
@@ -896,8 +939,14 @@ def train(args: argparse.Namespace) -> DQNAgent:
     )
     if not resumed and warmup != args.warmup:
         print(f"note: warmup reduced to {warmup} for this short run")
-    print(f"warmup: {warmup} | train_every: {args.train_every} | width: {args.width}")
-    print(f"device: {agent.device}")
+    print(
+        f"warmup: {warmup} | train_every: {args.train_every} | "
+        f"n-step: {args.n_step} | width: {args.width}"
+    )
+    amp = (
+        f"{agent.amp_dtype}" if agent.use_amp else "off"
+    )
+    print(f"device: {agent.device} | AMP: {amp}")
 
     # How often to capture a frame so the GIF has approximately --gif-frames
     # images across the whole run.
@@ -1065,6 +1114,69 @@ def train(args: argparse.Namespace) -> DQNAgent:
         })
         obs = env.reset()
 
+    # Fine-tuning starts from a good policy, but a freshly resumed run has an
+    # empty replay buffer.  For the first few updates the learner would only
+    # see random exploration data and can destroy the old policy before the
+    # new reward signal has any effect.  Filling the buffer with transitions
+    # from the loaded policy (new reward, full levels) keeps the early updates
+    # on-policy and makes the difference between fine-tuning and forgetting.
+    if resumed and args.warmstart_buffer > 0:
+        target = min(int(args.warmstart_buffer), int(args.replay_size))
+        if agent.buffer.size < target:
+            old_cap = env.cfg.level_cap
+            old_min = env.cfg.dots_removed_min
+            old_max = env.cfg.dots_removed_max
+            old_epsilon = agent.epsilon
+            env.cfg.level_cap = first_cap
+            env.cfg.dots_removed_min = 0
+            env.cfg.dots_removed_max = 0
+            agent.epsilon = args.warmstart_epsilon
+            print(
+                f"warm-start: filling replay buffer with {target:,} decisions "
+                f"from the loaded policy (epsilon {agent.epsilon:.2f}, "
+                f"n-step {args.n_step})...",
+                flush=True,
+            )
+            warm_obs = env.reset()
+            warm_nstep = NStepAccumulator(
+                args.n_step, agent.gamma, agent.remember
+            )
+            warm_started = time.perf_counter()
+            try:
+                for i in range(target):
+                    action = agent.act(warm_obs)
+                    next_obs, reward, done, info = env.step(action)
+                    terminal = done and not info["truncated"]
+                    warm_nstep.add(
+                        warm_obs, action, reward, next_obs, terminal
+                    )
+                    warm_obs = next_obs
+                    if done:
+                        warm_nstep.flush()
+                        warm_obs = env.reset()
+                    if (i + 1) % 25_000 == 0:
+                        print(
+                            f"  warm-start {i + 1:,}/{target:,} "
+                            f"({time.perf_counter() - warm_started:.0f}s)",
+                            flush=True,
+                        )
+                warm_nstep.flush()
+            finally:
+                agent.epsilon = old_epsilon
+                env.cfg.level_cap = old_cap
+                env.cfg.dots_removed_min = old_min
+                env.cfg.dots_removed_max = old_max
+            print(
+                f"warm-start complete: buffer size {agent.buffer.size:,} "
+                f"({time.perf_counter() - warm_started:.0f}s)",
+                flush=True,
+            )
+            obs = env.reset()
+    elif resumed and args.warmstart_buffer > 0:
+        print("warm-start: replay buffer is already full; skipping")
+
+    train_nstep = NStepAccumulator(args.n_step, agent.gamma, agent.remember)
+
     try:
         for generation in range(start_generation, args.generations + 1):
             generation_decisions = base_decisions + (
@@ -1097,7 +1209,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 terminal = done and not info["truncated"]
 
                 # ---- learn --------------------------------------------
-                agent.remember(obs, action, reward, next_obs, terminal)
+                train_nstep.add(obs, action, reward, next_obs, terminal)
                 agent.update_epsilon()
                 if global_decision > warmup and global_decision % args.train_every == 0:
                     loss = agent.learn()
@@ -1129,6 +1241,9 @@ def train(args: argparse.Namespace) -> DQNAgent:
 
                 # ---- episode bookkeeping ------------------------------
                 if done:
+                    # A time-limit episode is truncated, not terminal, so
+                    # the accumulator does not flush it by itself.
+                    train_nstep.flush()
                     episode += 1
                     levels_cleared = info["level"] - 1
                     dots = info.get(
@@ -1185,6 +1300,9 @@ def train(args: argparse.Namespace) -> DQNAgent:
                     )
 
             # ---- end of generation ------------------------------------
+            # Do not let a partial n-step window cross the episode reset at
+            # the start of the next generation.
+            train_nstep.flush()
             agent.save(checkpoint_path(out))
             gen_checkpoint = out / f"dqn_gen{generation}.pt"
             agent.save(gen_checkpoint)
@@ -1365,6 +1483,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         "level_cap": first_cap,
         "score_scale": reward_cfg.score_scale,
         "death_penalty": reward_cfg.death_penalty,
+        "step_penalty": reward_cfg.step_penalty,
         "stay_penalty": reward_cfg.stay_penalty,
         "dot_not_eaten_penalty": reward_cfg.dot_not_eaten_penalty,
         "dot_not_eaten_grace": reward_cfg.dot_not_eaten_grace,
@@ -1378,9 +1497,16 @@ def train(args: argparse.Namespace) -> DQNAgent:
         "partial_load": args.partial_load,
         "width": args.width,
         "warmup": warmup,
+        "warmstart_buffer": args.warmstart_buffer,
+        "warmstart_epsilon": args.warmstart_epsilon,
         "train_every": args.train_every,
+        "n_step": args.n_step,
+        "batch_size": args.batch_size,
+        "use_amp": agent.use_amp,
+        "amp_dtype": str(agent.amp_dtype) if agent.use_amp else None,
         "lr": args.lr,
         "lr_final": args.lr_final,
+        "epsilon_start": args.epsilon_start,
         "epsilon_end": args.epsilon_end,
         "epsilon_decay": args.epsilon_decay,
         "replay_size": args.replay_size,
@@ -1518,7 +1644,10 @@ def main() -> None:
     pg.init()
     try:
         agent = train(args)
-        live_play(agent, args)
+        if not args.no_live:
+            live_play(agent, args)
+        else:
+            print("final live game skipped (--no-live)")
     finally:
         pg.quit()
 

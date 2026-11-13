@@ -36,6 +36,9 @@ class RewardConfig:
     not change at all during the skipped frames.  This is different from
     step_penalty (which is charged for every decision): it specifically
     discourages parking in a corner or pressing into a wall forever.
+    The default step penalty is -0.005: small enough that eating a dot
+    (+0.2) easily pays for the moves needed to reach it, but large enough
+    that idling is never free.
 
     dot_not_eaten_penalty is charged once per decision after
     dot_not_eaten_grace consecutive decisions without eating a dot or
@@ -59,7 +62,7 @@ class RewardConfig:
 
     score_scale: float = 0.02
     death_penalty: float = -15.0
-    step_penalty: float = -0.001
+    step_penalty: float = -0.005
     stay_penalty: float = -0.02
     dot_not_eaten_penalty: float = -0.02
     dot_not_eaten_grace: int = 45
@@ -84,7 +87,7 @@ class EnvConfig:
                to zero so the score is comparable with full-level runs.
     """
 
-    frame_skip: int = 2
+    frame_skip: int = 4
     max_frames: int = 18000
     level_cap: int | None = 1
     seed: int | None = None

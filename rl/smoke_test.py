@@ -13,6 +13,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import numpy as np
 
 import map as maze
+from .buffer import NStepAccumulator
 from .config import GHOST_DIR_DIM, EnvConfig, RewardConfig
 from .pacman_env import PacmanEnv
 
@@ -225,6 +226,29 @@ def test_dot_curriculum():
     print("ok  endgame dot curriculum")
 
 
+def test_nstep_accumulator():
+    emitted = []
+    acc = NStepAccumulator(3, 0.5, lambda *args: emitted.append(args))
+    acc.add("s0", 0, 1.0, "s1", False)
+    acc.add("s1", 1, 2.0, "s2", False)
+    assert emitted == [], "n-step must wait for three transitions"
+    acc.add("s2", 2, 3.0, "s3", False)
+    assert len(emitted) == 1, emitted
+    obs, action, reward, next_obs, terminal = emitted[0]
+    assert (obs, action, next_obs) == ("s0", 0, "s3")
+    assert abs(reward - (1.0 + 0.5 * 2.0 + 0.25 * 3.0)) < 1e-9
+    assert terminal is False
+
+    acc.add("s3", 3, 4.0, "s4", True)
+    # The terminal transition flushes the rest of the window.
+    assert len(emitted) == 4, emitted
+    assert abs(emitted[1][2] - (2.0 + 0.5 * 3.0 + 0.25 * 4.0)) < 1e-9
+    assert abs(emitted[2][2] - (3.0 + 0.5 * 4.0)) < 1e-9
+    assert emitted[3][2] == 4.0
+    assert all(item[4] for item in emitted[1:])
+    print("ok  n-step accumulator")
+
+
 def test_danger_shaping():
     reward_cfg = RewardConfig(
         step_penalty=0.0,
@@ -285,6 +309,7 @@ if __name__ == "__main__":
     test_dot_not_eaten_penalty()
     test_ghost_direction_observation()
     test_dot_curriculum()
+    test_nstep_accumulator()
     test_danger_shaping()
     benchmark()
     print("ALL STAGE-0 TESTS PASSED")

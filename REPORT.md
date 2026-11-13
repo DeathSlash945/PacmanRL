@@ -99,7 +99,7 @@ Reward defaults in `rl/config.py`:
 | no movement for one decision | -0.02 |
 | no dot for 45 decisions | -0.02 per decision until the next dot |
 | near a dangerous ghost | up to -0.02 per decision within 5 tiles |
-| every decision | -0.001 (`step_penalty`) |
+| every decision | -0.005 (`step_penalty`) |
 
 The no-dot penalty is a progress signal, not a survival signal.  The danger
 penalty is the survival signal: a dangerous ghost within five tiles costs a
@@ -112,16 +112,25 @@ The ghost-combo scale is separate from the ordinary score scale.  Only the
 the game score itself are unchanged.  This makes a risky four-ghost chain
 less attractive without removing the reward for a good power-pellet play.
 
-For the aggressive next run the command uses
+The first aggressive continuation (`runs/train_dqn_final`) used
 `--ghost-score-scale 0.35 --danger-penalty 0.03 --danger-radius 5
---death-penalty -20 --level-clear-bonus 30`.  These are CLI overrides, so
-the original 10M result remains reproducible from its recorded config.
+--death-penalty -20 --level-clear-bonus 30`, but it reset epsilon to 1.0,
+changed gamma to 0.997 and started with an empty replay buffer.  It was
+stopped after 8M decisions with the generation-0 baseline still best
+(2129.0 score, 171.7 pellets); generation 8 reached only 1157.0 score and
+101.7 pellets.  That is catastrophic forgetting, not evidence that the new
+reward is wrong.  The updated recipe therefore keeps `gamma=0.995`, resets
+epsilon only to 0.1, lowers the learning rate, and warm-starts the buffer
+from the loaded policy.  The shape is deliberately gentler
+(`ghost_score_scale=0.5`, `danger_penalty=0.02`, clear bonus 50) so the old
+pellet policy is not destroyed before the new survival signal is learned.
 
-The anti-stay penalty is applied once per decision only when Pac-Man's
-position is unchanged after all skipped frames.  It is deliberately
-smaller than one dot, so it discourages corner-camping without teaching
-the agent that standing still is worse than dying.  The wrapper exposes
-`info["stayed"]` so the behaviour can be audited.
+The step penalty is now -0.005 per decision.  At 20 decisions per dot
+that is still only -0.1, half a dot, so normal travel to a pellet remains
+profitable; idling, however, never becomes free.  The anti-stay penalty is
+applied once per decision only when Pac-Man's position is unchanged after
+all skipped frames, so pressing into a wall costs both terms.  The wrapper
+exposes `info["stayed"]` so the behaviour can be audited.
 
 The `dot_not_eaten_penalty` is separate progress pressure.  After 45
 consecutive decisions without a dot or power pellet (3 seconds at
@@ -164,23 +173,40 @@ level 1.  The final system adds the changes that matter for a long run:
    chosen by `(level clears, pellets, score)`.  A resumed checkpoint is
    evaluated before training and entered as generation 0, so continuing a
    strong policy cannot silently replace it with a weaker one.
-6. **More updates.**  `--train-every 1` gives one gradient step per
-   decision, about twice the compute of the default but more sample
-   efficiency.
-7. **Ghost-direction observations.**  Position alone does not say where a
-   ghost will be next frame.  The observation now includes four one-hot
-   directions per ghost.  The optional MLP branch is zero-initialised when
-   transferring from an old checkpoint, so the starting policy is exactly
-   preserved.
-8. **Endgame dot curriculum.**  Training episodes can start with up to 160
-   ordinary dots already removed.  The agent therefore sees the last 80
-   pellets many times per generation instead of only when a full level is
-   almost finished.  Evaluation remains full-level.
-9. **Ghost-risk reward shaping.**  `ghost_score_scale` reduces the value of
-   ghost chains, while `danger_penalty`/`danger_radius` charge a small
-   amount for standing near a dangerous ghost.  This directly targets the
-   observed failure mode: farming power pellets and ghost combos instead of
-   running away.
+6. **Better GPU utilisation.**  The old loop did a batch-128 update after
+   every decision; each update is tiny, so kernel-launch and transfer
+   overhead dominated.  The new recipe uses batch 256 with one update every
+   two decisions (the same 128 samples per decision), enables CUDA mixed
+   precision (bf16 on the RTX 4060, about 1.5x faster than fp32), and keeps
+   the model at width 64.  This is a throughput change, not a change to the
+   learning target.
+7. **Warm-start replay.**  A resumed run has an empty buffer.  The first
+   updates would otherwise see only random exploration data and can erase
+   the checkpoint before the new reward has any effect.  `--warmstart-buffer
+   100000` collects 100k decisions from the loaded policy before training.
+8. **Gentle fine-tuning.**  `--epsilon-start 0.1 --reset-epsilon` gives a
+   short exploration phase without returning to a random policy;
+   `--lr 3e-5 --lr-final 1e-6` and `gamma=0.995` keep the Q-targets close
+   to the checkpoint.  This is the main fix for the failed
+   `train_dqn_final` continuation.
+9. **n-step returns.**  `--n-step 3` stores three-decision returns, so a
+   death or clear reaches the responsible actions faster.  The accumulator
+   flushes at episode and generation boundaries, so transitions never cross
+   a reset.
+10. **Ghost-direction observations.**  Position alone does not say where a
+    ghost will be next frame.  The observation includes four one-hot
+    directions per ghost.  The optional MLP branch is zero-initialised when
+    transferring from an old checkpoint, so the starting policy is exactly
+    preserved.
+11. **Endgame dot curriculum.**  Training episodes can start with ordinary
+    dots already removed.  The agent therefore sees the last pellets many
+    times per generation instead of only when a full level is almost
+    finished.  Evaluation remains full-level.
+12. **Ghost-risk reward shaping.**  `ghost_score_scale` reduces the value of
+    ghost chains, while `danger_penalty`/`danger_radius` charge a small
+    amount for standing near a dangerous ghost.  This directly targets the
+    observed failure mode: farming power pellets and ghost combos instead of
+    running away.
 
 ## Recommended run
 
@@ -191,25 +217,35 @@ PY=/home/deathslash/venvs/mlasgn/bin/python
 
 $PY train.py \
   --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
-  --generations 10 --total-decisions 20000000 \
+  --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
+  --generations 10 --total-decisions 10000000 \
   --curriculum --curriculum-max-level 4 \
-  --max-frames 60000 --width 64 --train-every 1 --gamma 0.997 \
-  --batch-size 128 --replay-size 150000 \
-  --epsilon-decay 3000000 --epsilon-end 0.01 --reset-epsilon \
-  --lr-final 5e-6 --eval-episodes 30 --eval-level-cap 0 \
-  --ghost-score-scale 0.35 --danger-penalty 0.03 --danger-radius 5 \
-  --death-penalty -20 --level-clear-bonus 30 \
-  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
-  --dot-not-eaten-grace 30 \
-  --dots-removed-min 0 --dots-removed-max 160 \
-  --gif-frames 100000 --out runs/train_dqn_final
+  --max-frames 60000 --width 64 \
+  --n-step 3 --train-every 2 --batch-size 256 --target-update 1000 \
+  --gamma 0.995 --replay-size 150000 \
+  --epsilon-start 0.1 --reset-epsilon \
+  --epsilon-decay 3000000 --epsilon-end 0.01 \
+  --lr 3e-5 --lr-final 1e-6 --eval-episodes 30 --eval-level-cap 0 \
+  --ghost-score-scale 0.5 --danger-penalty 0.02 --danger-radius 5 \
+  --death-penalty -20 --level-clear-bonus 50 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --dots-removed-min 0 --dots-removed-max 120 \
+  --gif-frames 0 --out runs/train_dqn_finetune
 ```
 
-`--partial-load` copies the convolutions, the dueling heads and the old
-18-column part of the trunk from the 10M checkpoint.  The new
-ghost-direction columns are zeroed, so generation 0 is exactly the old
-policy; the branch learns from there.  The run is expected to take roughly
-a day on the RTX 4060 because of the larger batch and 20M decisions.
+`--partial-load` copies the convolutions, the dueling heads, the trained
+ghost branch and the old trunk columns from the 10M checkpoint.  The
+warm-start buffer then fills the replay memory with that policy, so the
+first updates see good pellet-collecting behaviour rather than random
+exploration.  Epsilon restarts at 0.1, not 1.0, which is enough to explore
+the new reward without erasing the policy.  AMP, batch 256 and one update
+per two decisions reduce wall-clock time; n-step 3 improves credit
+assignment.  A 20k-decision benchmark on the RTX 4060 measured 189
+decisions/s for the old batch-128/every-decision/no-AMP loop and 261
+decisions/s for the new loop, a 1.4x speed-up; disabling the GIF removes
+another source of overhead.  The run is still an overnight job, but it
+spends less time launching tiny GPU kernels.
 
 If the run is interrupted, resume with the same output directory.  The
 next unfinished generation is detected from `progress.json` (or
@@ -219,21 +255,33 @@ to repeat a generation deliberately:
 ```bash
 $PY train.py --resume --generations 10 \
   --total-decisions 4000000 --curriculum --curriculum-max-level 4 \
-  --dots-removed-min 0 --dots-removed-max 160 \
-  --out runs/train_dqn_final
+  --max-frames 60000 --width 64 --n-step 3 --train-every 2 \
+  --batch-size 256 --target-update 1000 --gamma 0.995 \
+  --replay-size 150000 --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
+  --epsilon-start 0.1 --reset-epsilon --epsilon-decay 3000000 \
+  --epsilon-end 0.01 --lr 3e-5 --lr-final 1e-6 --eval-episodes 30 \
+  --eval-level-cap 0 --ghost-score-scale 0.5 --danger-penalty 0.02 \
+  --danger-radius 5 --death-penalty -20 --level-clear-bonus 50 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --dots-removed-min 0 --dots-removed-max 120 \
+  --out runs/train_dqn_finetune
 ```
 
 `--total-decisions` is the budget for the remaining generations.  The
-10-generation split gives one fixed-seed evaluation and checkpoint per 2M
-decisions, so the continuation gets its own learning curve.  Both the
+10-generation split gives one fixed-seed evaluation and checkpoint every
+1M decisions, so the continuation gets its own learning curve.  Both the
 resume baseline and every generation are evaluated with the endgame
 curriculum disabled and on the full game, so the comparison is honest.
 
-If the GPU is shared or time is short, start with 10M decisions and
-`--train-every 2`; the generation loop, endgame curriculum and evaluation
-still work the same.  The previous 10M run with `--train-every 1` took
-about 12.4 hours on the RTX 4060; the new run is longer because of 20M
-decisions and batch 128.
+If time is short, the same recipe works with `--generations 5
+--total-decisions 5000000`; the generation loop, warm-start, endgame
+curriculum and evaluation are unchanged.  The previous 10M run with batch
+128, one update per decision and no AMP took about 12.4 hours on the RTX
+4060.  The new recipe's larger batch and bf16 updates should improve
+throughput, but 10M decisions is still the dominant cost.  For a broader
+search, `scripts/train_parallel.sh 3 10000000` runs three reward variants in
+parallel and leaves their `eval.json` files for comparison.
 
 The output directory contains:
 
@@ -258,23 +306,27 @@ The output directory contains:
 The new run now has endgame experience, ghost directions and survival
 shaping, but none of these guarantees a clear.  The remaining risks are:
 
-1. **The endgame is only half the problem.**  Starting with 160 dots gone
-   teaches the last 80 pellets, but the agent still has to survive the
-   first 160 in a full evaluation episode.  The mixed 0..160 curriculum
+1. **The endgame is only half the problem.**  Starting with 120 dots gone
+   teaches the last 124 pellets, but the agent still has to survive the
+   first 124 in a full evaluation episode.  The mixed 0..120 curriculum
    keeps full-level experience in the buffer, which is why the long command
    does not remove dots from every episode.
 2. **Reward shaping can be overdone.**  A danger penalty that is too strong
    makes the agent timid; the no-dot penalty then pushes it back into
-   danger.  The command uses a small penalty (0.03 at one tile) and starts
+   danger.  The command uses a small penalty (0.02 at one tile) and starts
    from a policy that already eats 170 pellets, so the trade-off is
    visible in the generation table.
-3. **Exploration.**  A reset to epsilon 1.0 is necessary to escape the old
-   policy, but 3M decisions of decay on a 20M run leaves a long low-epsilon
-   phase.  If the first 3-4 generations do not beat generation 0, raise the
-   decay or use `--epsilon-end 0.02`.
+3. **Exploration.**  A full reset to epsilon 1.0 is *not* necessary, and
+   the failed continuation showed that it is harmful when the replay buffer
+   is empty.  The updated recipe starts at 0.1, which explores the new
+   reward while keeping the pellet policy.  If the first 3-4 generations do
+   not beat generation 0, first check whether the warm-start buffer and low
+   learning rate are actually being used; do not simply raise epsilon.
 4. **More decisions.**  A from-scratch DQN on full Pac-Man is a large
-   problem; 20M decisions is a serious attempt, not a guarantee.  A 50M
-   budget with the same features is the next step if clears are still zero.
+   problem; 10M decisions is a serious attempt, not a guarantee.  A 50M
+   budget with the same features is the next step if clears are still zero,
+   and `scripts/train_parallel.sh` is the cheaper way to try several reward
+   variants before committing to a longer single run.
 5. **Evaluation noise.**  Thirty episodes gives a useful estimate, but the
    score standard deviation is large.  Use 50-100 fixed seeds for a final
    claim, and report clears first, then pellets, then score.

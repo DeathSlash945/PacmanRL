@@ -25,9 +25,9 @@ command-line branches have been removed so there is one working path.
 | `obs.py` | turns a live `Game` into an 8x31x28 grid + 18-vector + 16 ghost-direction bits |
 | `pacman_env.py` | Gym-style `reset()` / `step()` wrapper; stay/no-dot/danger rewards and endgame dots |
 | `evaluate.py` | fixed-seed episode runner and metrics |
-| `agents/dqn.py` | Double DQN with replay and target network |
+| `agents/dqn.py` | Double DQN with replay, target network and optional CUDA AMP |
 | `networks.py` | convolutional dueling Q-network |
-| `buffer.py` | int8 replay buffer |
+| `buffer.py` | int8 replay buffer + n-step accumulator |
 | `train_dqn.py` | low-level DQN training loop with CSV logs |
 | `eval_agent.py` | evaluate a saved checkpoint |
 | `report.py` | build `metrics.csv`, `stats.json`, `summary.md` and the showcase |
@@ -127,13 +127,14 @@ Defaults in `config.RewardConfig`:
 | stays still for one decision | `-0.02` |
 | no dot for 45 decisions | `-0.02` per decision until the next dot |
 | near a dangerous ghost | up to `-0.02` per decision within 5 tiles |
-| per decision | `-0.001` (`step_penalty`) |
+| per decision | `-0.005` (`step_penalty`) |
 
 The game never subtracts score on death, so the death penalty is added
-explicitly.  The stay penalty is separate from the step penalty: it fires
-only when Pac-Man's position is unchanged over the whole decision, so it
-stops corner-camping without punishing normal movement or a legitimate
-pellet pause.
+explicitly.  The per-decision step penalty is `-0.005`: a dot is +0.2, so
+normal travel remains profitable, but idling is never free.  The stay
+penalty is separate from the step penalty: it fires only when Pac-Man's
+position is unchanged over the whole decision, so it stops corner-camping
+without punishing normal movement or a legitimate pellet pause.
 
 The no-dot penalty is separate progress pressure.  It starts after
 `dot_not_eaten_grace=45` decisions without a pellet (3 seconds at the
@@ -192,8 +193,18 @@ Some subtleties of this game matter for a correct wrapper:
 - Target network copied every 2,000 gradient steps.
 - Huber loss, Adam (`lr=1e-4`), gradient clipping at 10.
 - Epsilon-greedy: 1.0 -> 0.02 over 500k decisions by default.
-- One gradient step every 2 decisions by default; use `--train-every 1`
-  for the strongest long run.
+- CUDA mixed precision is on by default (`bf16` on the RTX 4060, `fp16`
+  with a gradient scaler on older cards); `--no-amp` disables it.
+- `--n-step N` stores N-step returns.  The default is 1 (classic one-step
+  DQN); 3 is recommended for fine-tuning because deaths and clears are
+  sparse.
+- One gradient step every 2 decisions by default.  For a fast long run use
+  `--train-every 2 --batch-size 256`, which keeps 128 samples per decision
+  but makes each GPU update larger.  `--train-every 1` is the slowest,
+  most sample-efficient option.
+- `--warmstart-buffer 100000` fills the replay buffer from the loaded
+  checkpoint before any gradient step.  This is the recommended way to
+  continue a good policy without catastrophic forgetting.
 
 ## Generations and curriculum
 
@@ -202,17 +213,24 @@ network or replay buffer:
 
 ```bash
 $PY train.py --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
-  --generations 10 --total-decisions 20000000 \
+  --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
+  --generations 10 --total-decisions 10000000 \
   --curriculum --curriculum-max-level 4 --max-frames 60000 \
-  --width 64 --train-every 1 --gamma 0.997 --batch-size 128 \
-  --replay-size 150000 --epsilon-decay 3000000 --epsilon-end 0.01 \
-  --reset-epsilon --lr-final 5e-6 --eval-episodes 30 \
-  --eval-level-cap 0 --ghost-score-scale 0.35 --danger-penalty 0.03 \
-  --danger-radius 5 --death-penalty -20 --level-clear-bonus 30 \
-  --stay-penalty -0.03 --dot-not-eaten-penalty -0.03 \
-  --dot-not-eaten-grace 30 --dots-removed-min 0 --dots-removed-max 160 \
-  --gif-frames 100000 --out runs/train_dqn_final
+  --width 64 --n-step 3 --train-every 2 --batch-size 256 \
+  --target-update 1000 --gamma 0.995 --replay-size 150000 \
+  --epsilon-start 0.1 --reset-epsilon --epsilon-decay 3000000 \
+  --epsilon-end 0.01 --lr 3e-5 --lr-final 1e-6 --eval-episodes 30 \
+  --eval-level-cap 0 --ghost-score-scale 0.5 --danger-penalty 0.02 \
+  --danger-radius 5 --death-penalty -20 --level-clear-bonus 50 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --dots-removed-min 0 --dots-removed-max 120 \
+  --gif-frames 0 --out runs/train_dqn_finetune
 ```
+
+For multiple candidates, `scripts/train_parallel.sh 3 10000000` starts
+three of these runs with different reward settings and writes each to
+`runs/parallel/seedN`; compare their `eval.json` files.
 
 - `--curriculum` makes generation 1 cap at level 1, generation 2 at level
   2, and so on.  After `--curriculum-max-level`, later generations have no
@@ -240,9 +258,10 @@ $PY train.py --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
 - `--resume-from PATH` loads an explicit checkpoint.  Combined with a new
   `--out` directory it preserves the original run's logs and GIF while the
   continuation writes its own report.
-- `--reset-epsilon` restarts epsilon decay at 1.0 on resume, which gives
-  the agent a fresh exploration phase.  Without it, the checkpoint's low
-  epsilon is kept.
+- `--reset-epsilon` restarts epsilon decay from `--epsilon-start` on
+  resume (1.0 by default, but 0.1 is recommended for fine-tuning).  Without
+  it, the checkpoint's low epsilon is kept.  A reset to 1.0 should only be
+  used when deliberately throwing away the old policy.
 - At the end of every run `train.py` writes `metrics.csv`, `stats.json`,
   `summary.md` and `training_showcase.png`.  Existing runs can be rebuilt
   with `python -m rl.report --run <directory>`; the same command also works

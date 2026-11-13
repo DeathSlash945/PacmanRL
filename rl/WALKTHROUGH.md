@@ -45,7 +45,7 @@ observation code does not need pygame just to learn the board size.
 class RewardConfig:
     score_scale: float = 0.02
     death_penalty: float = -15.0
-    step_penalty: float = -0.001
+    step_penalty: float = -0.005
     stay_penalty: float = -0.02
     dot_not_eaten_penalty: float = -0.02
     dot_not_eaten_grace: int = 45
@@ -61,8 +61,10 @@ class RewardConfig:
 - `death_penalty=-15`: the game subtracts no score on death, so this is
   the explicit survival signal.  It is large enough to discourage
   suicide but much smaller than the value of a cleared level.
-- `step_penalty=-0.001`: a tiny cost for every decision.  It is small
-  enough not to compete with the pellet reward but discourages drifting.
+- `step_penalty=-0.005`: a small cost for every decision.  A dot is
+  +0.2, so normal travel remains profitable (20 decisions cost 0.1), but
+  idling or pressing into a wall is never free.  It is deliberately paired
+  with the larger stay penalty below.
 - `stay_penalty=-0.02`: charged once per decision only when Pac-Man's
   position did not change at all.  This is the anti-camping term the
   project asked for.  It is one tenth of a dot, so it prevents "park in a
@@ -595,10 +597,20 @@ the remaining decision budget, not the original total.  `--resume-from
 PATH` loads an explicit checkpoint instead of `<out>/dqn.pt`; pairing it
 with a new `--out` preserves the original run's logs and GIF.
 `--reset-epsilon` sets the loaded agent's decision counter to zero and
-epsilon back to 1.0, which is useful when a checkpoint has settled into a
-local policy.  `--partial-load` transfers an old architecture into the new
-ghost-direction network; the old policy is preserved exactly because the
-new input columns start at zero.
+epsilon back to `--epsilon-start` (1.0 by default).  For a fine-tune, pass
+`--epsilon-start 0.1`: a full reset to 1.0 explores randomly and can erase
+the checkpoint before the new reward signal has any effect.
+`--warmstart-buffer N` fills the replay buffer with N transitions from the
+loaded policy before the first gradient step, so early updates are not
+dominated by random exploration.  `--partial-load` transfers an old
+architecture into the new ghost-direction network; the old policy is
+preserved exactly because the new input columns start at zero.
+
+The training loop also wraps transitions in an `NStepAccumulator`.  With
+`--n-step 3`, the stored target includes three decisions of reward, which
+shortens the path from a death or level clear back to the responsible
+actions.  The accumulator flushes on terminal states, time-limit episode
+ends and generation boundaries, so a return never crosses a reset.
 
 `agent.update_epsilon()` decays linearly from 1.0 to `--epsilon-end`
 (0.02) over `--epsilon-decay` decisions (500k by default).  A long run can
@@ -615,6 +627,23 @@ if args.lr_final is not None:
 This is optional.  A final rate of `1e-5` lets the network settle instead
 of oscillating around a good policy at the end of a multi-million-decision
 run.
+
+### 7.6b Mixed precision and update scheduling
+
+`DQNAgent` runs the forward pass under `torch.autocast` when the device is
+CUDA.  The RTX 4060 supports bf16, which has the same exponent range as
+fp32 and therefore needs no gradient scaler; older cards fall back to fp16
+with `torch.amp.GradScaler`.  The optimizer and saved weights stay in
+fp32, so checkpoints are unaffected.  `--no-amp` disables the feature if a
+driver or custom kernel misbehaves.
+
+The old loop took one batch-128 gradient step after every decision.  That
+leaves the GPU with many tiny kernels and a lot of launch overhead.  The
+recommended long-run setting is `--train-every 2 --batch-size 256`: the
+same 128 samples per decision, but half as many, twice-as-large updates.
+Action selection is still one batched forward per decision, so the policy
+does not change between the two collected transitions in any meaningful
+way.  Trace the exact flags into `run.json` when comparing throughput.
 
 ### 7.7 Episode bookkeeping
 
