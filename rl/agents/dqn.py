@@ -35,6 +35,10 @@ class DQNAgent:
         seed=0,
         use_ghost_dir=False,
         use_amp=True,
+        use_per=False,
+        per_alpha=0.6,
+        per_beta=0.4,
+        per_eps=1e-3,
     ):
         self.device = torch.device(
             device if device is not None
@@ -71,7 +75,15 @@ class DQNAgent:
             enabled=self.use_amp and self.amp_dtype == torch.float16,
         )
 
-        self.buffer = ReplayBuffer(replay_size, seed=seed)
+        self.buffer = ReplayBuffer(
+            replay_size,
+            seed=seed,
+            prioritized=use_per,
+            alpha=per_alpha,
+            eps=per_eps,
+        )
+        self.use_per = bool(use_per)
+        self.per_beta = float(per_beta)
         self._build_networks()
 
         self.decisions = 0
@@ -124,7 +136,7 @@ class DQNAgent:
         if self.buffer.size < self.batch_size:
             return None
 
-        batch = self.buffer.sample(self.batch_size)
+        batch = self.buffer.sample(self.batch_size, beta=self.per_beta)
         grid = batch["grid"].to(self.device).float() / 2.0
         vec = batch["vec"].to(self.device)
         ghost_dir = None
@@ -159,7 +171,19 @@ class DQNAgent:
 
             # The loss itself is computed in float32 so a rare large target
             # cannot overflow the reduced-precision forward pass.
-            loss = F.smooth_l1_loss(q.float(), target.float())
+            q_float = q.float()
+            target_float = target.float()
+            loss_per_sample = F.smooth_l1_loss(
+                q_float, target_float, reduction="none"
+            )
+            td_error = (target_float - q_float).detach()
+            if "weights" in batch:
+                # Prioritised replay is biased towards high-error
+                # transitions; importance weights undo that bias.
+                weights = batch["weights"].to(self.device)
+                loss = (loss_per_sample * weights).mean()
+            else:
+                loss = loss_per_sample.mean()
 
         self.optimizer.zero_grad(set_to_none=True)
         if self.scaler.is_enabled():
@@ -174,6 +198,10 @@ class DQNAgent:
             self.optimizer.step()
 
         self.updates += 1
+        if "indices" in batch:
+            self.buffer.update_priorities(
+                batch["indices"].numpy(), td_error.cpu().numpy()
+            )
         if self.updates % self.target_update == 0:
             self.target.load_state_dict(self.online.state_dict())
 

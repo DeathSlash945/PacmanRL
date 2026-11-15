@@ -132,6 +132,95 @@ record a fresh demo after training, use
 `python -m rl.record --agent dqn --checkpoint runs/train_dqn_finetune/best.pt
 --out runs/train_dqn_finetune/demo.gif --frames 6000`.
 
+### Clearing the board: the strategy run
+
+The fine-tune above keeps the 2129-point policy, but that policy has never
+cleared level 1: it eats about 170 of 244 pellets and loses its three
+lives.  The strategy run targets exactly that gap.  It adds:
+
+- **A clear bonus on every level clear.**  Previously the bonus was only
+  paid when a *capped* episode ended, so a full-game episode (and every
+  evaluation) never received it.  That removed the main reward for
+  finishing a board.
+- **Progress-scaled death penalty.**  Dying at 240/244 pellets costs twice
+  as much as dying at the start, so a nearly-finished board is protected.
+- **Lives bonus on a clear.**  A clean clear is worth more than one that
+  cost two deaths.
+- **An endgame curriculum ramp with a high bias.**  Early generations see
+  full boards; later ones mostly start with only a few pellets left, which
+  is where the old agent always died.
+- **Prioritised replay (PER).**  Clears and deaths are rare; PER keeps the
+  transitions that explain them in rotation.
+- **A no-progress limit.**  Loitering without eating a pellet ends the
+  episode instead of collecting step penalties forever.  Evaluation
+  disables it, so scores stay comparable.
+
+```bash
+PY=/home/deathslash/venvs/mlasgn/bin/python
+$PY train.py \
+  --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
+  --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
+  --generations 12 --total-decisions 12000000 \
+  --curriculum --curriculum-max-level 2 \
+  --max-frames 30000 --width 64 \
+  --n-step 3 --train-every 2 --batch-size 256 --target-update 1000 \
+  --gamma 0.995 --replay-size 200000 \
+  --epsilon-start 0.1 --reset-epsilon \
+  --epsilon-decay 4000000 --epsilon-end 0.02 \
+  --lr 3e-5 --lr-final 1e-6 --eval-episodes 50 --eval-level-cap 0 \
+  --ghost-score-scale 0.4 --danger-penalty 0.02 --danger-radius 5 \
+  --death-penalty -20 --death-penalty-progress 1.0 \
+  --level-clear-bonus 100 --level-clear-lives-bonus 25 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --no-progress-limit 400 --no-progress-penalty -10 \
+  --dots-removed-min 0 --dots-removed-max 200 \
+  --dots-removed-bias 2.0 --endgame-ramp \
+  --per --per-alpha 0.6 --per-beta 0.4 \
+  --save-every 1000000 --log-every 100000 \
+  --gif-frames 0 --out runs/train_dqn_strategy
+```
+
+Do not run all 12M blindly.  Read `runs/train_dqn_strategy/eval_gen*.json`
+after generation 3-4 (roughly 3-4M decisions):
+
+- pellets rising generation over generation and `clears_mean` becoming
+  nonzero: keep going;
+- pellets flat or falling for three generations: stop, and either lower
+  `--lr` further or reduce `--dots-removed-bias` so the agent still sees
+  full boards.
+
+If the run is improving and you want to extend it, reuse the same reward
+and algorithm flags with `--resume`, a larger generation count and an
+explicit endgame range (drop `--endgame-ramp`, which is defined relative to
+the current `--generations`):
+
+```bash
+$PY train.py --resume --generations 24 --total-decisions 12000000 \
+  --warmstart-buffer 50000 --warmstart-epsilon 0.05 \
+  --curriculum --curriculum-max-level 2 --max-frames 30000 --width 64 \
+  --n-step 3 --train-every 2 --batch-size 256 --target-update 1000 \
+  --gamma 0.995 --replay-size 200000 \
+  --epsilon-end 0.02 --epsilon-decay 4000000 \
+  --lr 3e-5 --lr-final 1e-6 --eval-episodes 50 --eval-level-cap 0 \
+  --ghost-score-scale 0.4 --danger-penalty 0.02 --danger-radius 5 \
+  --death-penalty -20 --death-penalty-progress 1.0 \
+  --level-clear-bonus 100 --level-clear-lives-bonus 25 \
+  --stay-penalty -0.03 --step-penalty -0.005 \
+  --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
+  --no-progress-limit 400 --no-progress-penalty -10 \
+  --dots-removed-min 120 --dots-removed-max 200 --dots-removed-bias 2 \
+  --per --per-alpha 0.6 --per-beta 0.4 \
+  --out runs/train_dqn_strategy
+```
+
+`--resume` continues at the next unfinished generation and splits the new
+budget across generations 13-24.  Reward and DQN settings are **not** read
+from `run.json`, so they must be repeated; otherwise the defaults in
+`rl/config.py` silently replace the strategy values.
+
+The best checkpoint is selected by clears first, then pellets, then score,
+so a worse-scoring generation can still be kept if it clears more.
 
 If you want more than one candidate per wall-clock hour, launch two or
 three independent fine-tunes in parallel.  They share the GPU and use
@@ -158,6 +247,12 @@ What the important flags mean:
 | `--curriculum` | Generation 1 is capped at level 1, generation 2 at level 2, ... Every episode still starts at level 1; the cap only decides when it ends |
 | `--curriculum-max-level K` | After level K, later generations play the full game |
 | `--dots-removed-min/max` | Endgame curriculum: each training episode starts with a random number of ordinary dots already gone (power pellets stay) |
+| `--dots-removed-bias` | Skew that random count towards the maximum; 2-3 makes most episodes start near the end of the board |
+| `--endgame-ramp` | Scale the dot-removal range by generation, so early generations see full boards and later ones focus on the endgame |
+| `--death-penalty-progress` | Extra death penalty proportional to how much of the board was cleared; 1.0 doubles it at 100% |
+| `--level-clear-lives-bonus` | Reward per spare life when a level is cleared |
+| `--no-progress-limit`, `--no-progress-penalty` | End an episode after N decisions without a pellet; evaluation disables this so scores stay comparable |
+| `--per`, `--per-alpha`, `--per-beta`, `--per-eps` | Prioritised experience replay and its sampling/importance weights |
 | `--danger-penalty`, `--danger-radius` | Small per-decision penalty for being close to a dangerous ghost; gives a gradient before the death penalty |
 | `--step-penalty` | Per-decision movement cost; the default is -0.005, small enough that 20 moves still cost less than one dot |
 | `--ghost-score-scale` | Scales only the ghost-combo score reward; 0.5 halves it, 0.35 makes risky chasing much less attractive |

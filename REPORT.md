@@ -94,10 +94,11 @@ Reward defaults in `rl/config.py`:
 | power pellet | +1.0 |
 | ghost | +4 / +8 / +16 / +32, scaled by `ghost_score_scale=0.5` |
 | fruit | score value x 0.02 |
-| death | -15 |
-| level clear | +20 |
+| death | -15 by default; the strategy run uses -20, doubled at full board progress (`death_penalty_progress=1.0`) |
+| level clear | +20 by default; the strategy run uses +100, plus +25 per spare life |
 | no movement for one decision | -0.02 |
 | no dot for 45 decisions | -0.02 per decision until the next dot |
+| no dot for 400 decisions | episode ends with -10 (`no_progress_limit`) |
 | near a dangerous ghost | up to -0.02 per decision within 5 tiles |
 | every decision | -0.005 (`step_penalty`) |
 
@@ -282,6 +283,32 @@ curriculum and evaluation are unchanged.  The previous 10M run with batch
 throughput, but 10M decisions is still the dominant cost.  For a broader
 search, `scripts/train_parallel.sh 3 10000000` runs three reward variants in
 parallel and leaves their `eval.json` files for comparison.
+
+### Clearing the board: the strategy run
+
+The 10M curriculum policy is the strongest checkpoint so far, but it still
+loses all three lives around 170/244 pellets.  Three changes address that
+failure directly:
+
+1. **The clear bonus is now paid on every level clear.**  It used to be
+   added only when a capped episode ended, so a full-game episode (and
+   every evaluation) never received it.  The agent had no reward for
+   finishing a board in exactly the setting that is evaluated.
+2. **Deaths scale with progress.**  `death_penalty_progress=1.0` doubles
+   the death penalty on a board that is already 100% eaten, so protecting
+   a nearly-finished level is worth more than the remaining pellets.
+3. **The endgame curriculum is ramped and biased.**  `--endgame-ramp`
+   makes early generations see full boards and later ones focus on the
+   endgame; `--dots-removed-bias 2` makes most of those late episodes
+   start with only a few pellets left.  Prioritised replay keeps the rare
+   clear/death transitions in rotation, and `--no-progress-limit 400`
+   turns endless loitering into a terminal failure (evaluation disables
+   the limit so scores stay comparable).
+
+The full command is in `README.md` under "Clearing the board: the strategy
+run".  Do not spend the whole 20M budget without checking the generation
+table: if pellets are not rising by generation 3-4, stop and reduce the
+learning rate or the curriculum bias instead of waiting for the end.
 
 The output directory contains:
 

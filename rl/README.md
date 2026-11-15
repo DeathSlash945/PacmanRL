@@ -122,10 +122,11 @@ Defaults in `config.RewardConfig`:
 | power pellet | `+50 * 0.02 = +1.0` |
 | ghost | `+200/400/800/1600 * 0.02 * ghost_score_scale` (`scale=0.5` by default) |
 | fruit | score value `* 0.02` |
-| death | `-15` |
-| level clear | `+20` |
+| death | `death_penalty`; the strategy run uses `-20`, scaled by `1 + progress` |
+| level clear | `level_clear_bonus` on **every** clear; strategy run `+100` plus `+25` per spare life |
 | stays still for one decision | `-0.02` |
 | no dot for 45 decisions | `-0.02` per decision until the next dot |
+| no dot for 400 decisions | episode ends with `-10` (`no_progress_limit`) |
 | near a dangerous ghost | up to `-0.02` per decision within 5 tiles |
 | per decision | `-0.005` (`step_penalty`) |
 
@@ -237,6 +238,21 @@ three of these runs with different reward settings and writes each to
   level cap.
 - `--dots-removed-min/max` gives the agent endgame transitions without
   throwing away full-level experience; the range is sampled per episode.
+- `--dots-removed-bias` skews that per-episode count towards the maximum,
+  and `--endgame-ramp` scales the whole range by generation.  Together
+  they let early generations see full boards and later ones concentrate
+  on the last few pellets.
+- `--death-penalty-progress` multiplies the death penalty by
+  `1 + progress`, and `--level-clear-lives-bonus` pays extra for each
+  spare life at a clear.  The clear bonus itself is now paid on every
+  level clear, including uncapped full-game episodes.
+- `--no-progress-limit N` ends a training episode after N decisions
+  without a pellet; `--no-progress-penalty` is its terminal reward.
+  Evaluation disables the limit so old and new scores stay comparable.
+- `--per` enables proportional prioritised replay in `rl/buffer.py`.
+  `--per-alpha` controls how strongly priorities are followed,
+  `--per-beta` is the initial importance-sampling exponent (annealed to
+  1.0), and `--per-eps` keeps every transition sampleable.
 - `--partial-load` transfers a checkpoint from the old observation
   architecture.  The new ghost-direction columns start at zero, so the
   resumed policy is exactly preserved before training changes it.

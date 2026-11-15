@@ -95,7 +95,16 @@ class PacmanEnv:
         # A private RNG makes the curriculum deterministic for a given
         # episode seed even though the game itself uses random.seed().
         rng = np.random.default_rng((int(seed) + 0x9E3779B9) & 0xFFFFFFFF)
-        count = int(rng.integers(low, high + 1))
+        # A bias > 0 pushes the sampled count towards the high end.  The
+        # uniform default is kept for backward compatibility, but endgame
+        # training wants most episodes to start with only a few pellets
+        # left, which the bias provides.
+        u = float(rng.random())
+        bias = max(0.0, float(getattr(cfg, "dots_removed_bias", 0.0)))
+        if bias > 0.0:
+            u = u ** (1.0 / (1.0 + bias))
+        count = low + int(round(u * (high - low)))
+        count = max(low, min(high, count))
         if count <= 0:
             return
 
@@ -103,6 +112,20 @@ class PacmanEnv:
         for index in chosen:
             maze.pellets.pop(dot_tiles[int(index)], None)
         self.dots_removed = count
+
+    def _death_reward(self) -> float:
+        """Death penalty, optionally scaled by progress on the current board.
+
+        Dying with 240/244 pellets eaten should hurt much more than dying at
+        the start of the episode; otherwise there is no gradient towards
+        protecting a nearly-finished board.
+        """
+        penalty = self.cfg.reward.death_penalty
+        weight = self.cfg.reward.death_penalty_progress
+        if weight:
+            progress = self.dots_eaten / max(1, self.dots_at_start)
+            penalty *= 1.0 + weight * min(1.0, progress)
+        return penalty
 
     def _danger_level(self) -> float:
         """Largest danger from a scatter/chase ghost within danger_radius.
@@ -149,6 +172,7 @@ class PacmanEnv:
         done = False
         dot_eaten = False
         ghost_score_total = 0
+        levels_cleared_any = 0
 
         # Track actual displacement, not just Pac-Man's `moving` flag.  The
         # flag is only refreshed at tile centres, and a short pellet pause can
@@ -178,6 +202,15 @@ class PacmanEnv:
                 # next_level() refills the maze but Game.next_level() does
                 # not update the fruit-timing total.
                 self.game.total = len(maze.pellets)
+                # Reward *every* level clear, not only the clear that ends a
+                # capped episode.  With an uncapped full-game episode the
+                # agent previously never received the clear bonus at all,
+                # which removed the main signal for finishing a board.
+                reward += self.cfg.reward.level_clear_bonus
+                lives_bonus = self.cfg.reward.level_clear_lives_bonus
+                if lives_bonus:
+                    reward += lives_bonus * max(0, self.game.pacman.lives - 1)
+                levels_cleared_any += 1
             else:
                 eaten_now = max(0, pellets_before - len(maze.pellets))
             if eaten_now:
@@ -204,7 +237,7 @@ class PacmanEnv:
 
             if self.game.pacman.lives < lives_before:
                 died = True
-                reward += self.cfg.reward.death_penalty
+                reward += self._death_reward()
 
                 # With fx=False, reset_round() already respawned Pac-Man
                 # and forced dir/next_dir back to 'left'.  Continuing the
@@ -222,7 +255,6 @@ class PacmanEnv:
             # increments game.level and resets the round on the new level.
             if self.cfg.level_cap is not None and self.game.level > self.cfg.level_cap:
                 level_cleared = True
-                reward += self.cfg.reward.level_clear_bonus
                 done = True
                 break
 
@@ -234,7 +266,13 @@ class PacmanEnv:
         # Charge the anti-camping penalty once per decision, not per game
         # frame.  A death, level clear, or timeout is already a terminal
         # event and must not also be labelled as "staying still".
-        stayed = not moved and not died and not level_cleared and not truncated
+        stayed = (
+            not moved
+            and not died
+            and not level_cleared
+            and not levels_cleared_any
+            and not truncated
+        )
         if stayed:
             reward += self.cfg.reward.stay_penalty
 
@@ -255,6 +293,16 @@ class PacmanEnv:
         )
         if dot_not_eaten:
             reward += self.cfg.reward.dot_not_eaten_penalty
+
+        # Endless loitering is a failure, not a way to farm step penalties.
+        # This is a real terminal state (truncated stays False), so the
+        # n-step accumulator does not bootstrap past it.
+        no_progress = False
+        limit = int(self.cfg.reward.no_progress_limit)
+        if limit > 0 and not done and self.decisions_since_dot >= limit:
+            no_progress = True
+            reward += self.cfg.reward.no_progress_penalty
+            done = True
 
         # Shaping: being close to a dangerous ghost is bad before it becomes
         # a death.  Skip terminal decisions, where reset_round() has already
@@ -280,11 +328,13 @@ class PacmanEnv:
             "dots_at_start": self.dots_at_start,
             "died": died,
             "level_cleared": level_cleared,
+            "levels_cleared": levels_cleared_any,
             "truncated": truncated,
             "stayed": stayed,
             "dot_eaten": dot_eaten,
             "decisions_since_dot": self.decisions_since_dot,
             "dot_not_eaten_penalty": dot_not_eaten,
+            "no_progress": no_progress,
             "ghost_score": ghost_score_total,
             "danger": danger,
             "danger_penalty": danger_penalty,

@@ -58,6 +58,21 @@ class RewardConfig:
     a dangerous (scatter/chase) ghost.  It is scaled linearly by distance
     within danger_radius tiles.  It is not a replacement for the death
     penalty; it gives the agent a gradient before it is already dead.
+
+    death_penalty_progress makes a death hurt more when the board is nearly
+    finished: the effective penalty is death_penalty * (1 + w * progress),
+    where progress is the fraction of the episode's pellets already eaten.
+    Dying with 240/244 pellets costs far more than dying at the start, which
+    is exactly the behaviour needed to finish a level instead of farming.
+
+    level_clear_lives_bonus adds a bonus for every life still in reserve
+    when a level is cleared, so a clean clear is worth more than a clear
+    that cost two deaths.
+
+    no_progress_limit terminates an episode after that many decisions
+    without a pellet.  It turns endless corridor-loitering into a real
+    failure instead of letting a stalled policy collect step penalties
+    forever.  Zero disables the limit (the default).
     """
 
     score_scale: float = 0.02
@@ -67,9 +82,13 @@ class RewardConfig:
     dot_not_eaten_penalty: float = -0.02
     dot_not_eaten_grace: int = 45
     level_clear_bonus: float = 20.0
+    level_clear_lives_bonus: float = 0.0
     ghost_score_scale: float = 0.5
     danger_penalty: float = 0.02
     danger_radius: int = 5
+    death_penalty_progress: float = 0.0
+    no_progress_limit: int = 0
+    no_progress_penalty: float = -10.0
 
 
 @dataclass
@@ -85,6 +104,9 @@ class EnvConfig:
                with a random number of ordinary dots already removed.
                Power pellets are never removed.  Evaluation must set both
                to zero so the score is comparable with full-level runs.
+               dots_removed_bias > 0 skews that random count towards the
+               maximum, so the agent spends more episodes in the last few
+               pellets instead of mostly seeing early boards.
     """
 
     frame_skip: int = 4
@@ -93,4 +115,5 @@ class EnvConfig:
     seed: int | None = None
     dots_removed_min: int = 0
     dots_removed_max: int = 0
+    dots_removed_bias: float = 0.0
     reward: RewardConfig = field(default_factory=RewardConfig)

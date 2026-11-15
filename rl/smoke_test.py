@@ -13,7 +13,7 @@ os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 import numpy as np
 
 import map as maze
-from .buffer import NStepAccumulator
+from .buffer import NStepAccumulator, ReplayBuffer
 from .config import GHOST_DIR_DIM, EnvConfig, RewardConfig
 from .pacman_env import PacmanEnv
 
@@ -271,6 +271,144 @@ def test_danger_shaping():
     print(f"ok  danger shaping (level={danger:.2f})")
 
 
+def test_prioritized_replay():
+    obs = {
+        "grid": np.zeros((8, 31, 28), dtype=np.float32),
+        "vec": np.zeros(18, dtype=np.float32),
+        "ghost_dir": np.zeros(16, dtype=np.float32),
+    }
+    buf = ReplayBuffer(capacity=64, seed=0, prioritized=True)
+    for i in range(32):
+        buf.add(obs, i % 4, float(i), obs, False)
+
+    batch = buf.sample(8, beta=0.4)
+    assert {"grid", "weights", "indices"} <= set(batch), sorted(batch)
+    assert batch["weights"].shape == (8,), batch["weights"].shape
+    assert batch["indices"].shape == (8,), batch["indices"].shape
+    weights = batch["weights"].numpy()
+    assert (weights > 0).all() and (weights <= 1.0 + 1e-6).all(), weights
+    indices = batch["indices"].numpy()
+    assert int(indices.max()) < buf.size, indices
+
+    buf.update_priorities(indices, np.full(8, 3.0))
+    assert (buf.priority[indices] >= 3.0 - 1e-6).all()
+    assert buf.max_priority >= 3.0
+
+    uniform = ReplayBuffer(capacity=8, seed=1)
+    for _ in range(4):
+        uniform.add(obs, 0, 0.0, obs, False)
+    assert "weights" not in uniform.sample(2)
+    print("ok  prioritized replay")
+
+
+def test_progress_death_penalty():
+    cfg = EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=1,
+        reward=RewardConfig(death_penalty=-10.0,
+                            death_penalty_progress=1.0),
+    )
+    env = PacmanEnv(cfg)
+    env.reset(seed=6)
+    env.dots_at_start = 244
+    env.dots_eaten = 0
+    assert abs(env._death_reward() - (-10.0)) < 1e-9
+    env.dots_eaten = 122
+    assert abs(env._death_reward() - (-15.0)) < 1e-9
+    env.dots_eaten = 244
+    assert abs(env._death_reward() - (-20.0)) < 1e-9
+    print("ok  progress-scaled death penalty")
+
+
+def test_level_clear_lives_bonus():
+    reward_cfg = RewardConfig(
+        step_penalty=0.0,
+        stay_penalty=0.0,
+        dot_not_eaten_penalty=0.0,
+        danger_penalty=0.0,
+        level_clear_bonus=10.0,
+        level_clear_lives_bonus=5.0,
+    )
+    env = PacmanEnv(EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=1, reward=reward_cfg
+    ))
+    env.reset(seed=8)
+    maze.pellets.clear()
+    obs, reward, done, info = env.step(0)
+    assert done and info["level_cleared"], info
+    # 3 lives means two spare lives, so 10 + 2 * 5 = 20.
+    assert abs(reward - 20.0) < 1e-9, reward
+    print(f"ok  lives clear bonus (reward={reward:.2f})")
+
+
+def test_uncapped_clear_bonus():
+    reward_cfg = RewardConfig(
+        step_penalty=0.0,
+        stay_penalty=0.0,
+        dot_not_eaten_penalty=0.0,
+        danger_penalty=0.0,
+        level_clear_bonus=10.0,
+        level_clear_lives_bonus=5.0,
+    )
+    env = PacmanEnv(EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=None, reward=reward_cfg
+    ))
+    env.reset(seed=10)
+    maze.pellets.clear()
+    obs, reward, done, info = env.step(0)
+    assert not done, info
+    assert info["levels_cleared"] == 1, info
+    assert env.game.level == 2, env.game.level
+    # 10 + 2 * 5 = 20, plus any pellet eaten in the remaining skip frames.
+    assert reward >= 20.0 - 1e-9, reward
+    print(f"ok  uncapped clear bonus (reward={reward:.2f})")
+
+
+def test_no_progress_limit():
+    reward_cfg = RewardConfig(
+        step_penalty=0.0,
+        stay_penalty=0.0,
+        dot_not_eaten_penalty=0.0,
+        dot_not_eaten_grace=9999,
+        danger_penalty=0.0,
+        no_progress_limit=3,
+        no_progress_penalty=-7.0,
+    )
+    env = PacmanEnv(EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=1, reward=reward_cfg
+    ))
+    env.reset(seed=9)
+    pac = env.game.pacman
+    pac.x, pac.y = 14, 23
+    pac.dir = pac.next_dir = "up"
+    maze.pellets.pop((14, 23), None)
+
+    for step in range(3):
+        obs, reward, done, info = env.step(0)
+        assert not info["dot_eaten"], info
+        if step < 2:
+            assert not done, info
+    assert done and info["no_progress"], info
+    assert abs(reward - (-7.0)) < 1e-9, reward
+    print("ok  no-progress termination")
+
+
+def test_dot_curriculum_bias():
+    cfg = EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=1,
+        dots_removed_min=0, dots_removed_max=200,
+        dots_removed_bias=3.0,
+    )
+    env = PacmanEnv(cfg)
+    counts = []
+    for seed in range(40):
+        env.reset(seed=seed)
+        counts.append(env.dots_removed)
+    mean = float(np.mean(counts))
+    assert 0 <= min(counts) and max(counts) <= 200, (min(counts), max(counts))
+    assert mean > 130.0, mean
+    print(f"ok  biased dot curriculum (mean removed={mean:.0f})")
+
+
 def benchmark(decisions=20000):
     env = PacmanEnv()
     env.reset(seed=0)
@@ -309,7 +447,13 @@ if __name__ == "__main__":
     test_dot_not_eaten_penalty()
     test_ghost_direction_observation()
     test_dot_curriculum()
+    test_dot_curriculum_bias()
     test_nstep_accumulator()
+    test_prioritized_replay()
+    test_progress_death_penalty()
+    test_level_clear_lives_bonus()
+    test_uncapped_clear_bonus()
+    test_no_progress_limit()
     test_danger_shaping()
     benchmark()
     print("ALL STAGE-0 TESTS PASSED")

@@ -23,7 +23,23 @@ def encode_grid(grid):
 
 
 class ReplayBuffer:
-    def __init__(self, capacity=100_000, seed=0):
+    """Ring buffer with optional prioritised sampling.
+
+    With ``prioritized=False`` (the default) ``sample`` draws uniformly,
+    exactly as before.  With ``prioritized=True`` it implements
+    proportional prioritised experience replay: each transition carries a
+    priority, sampling is proportional to ``priority ** alpha``, and the
+    returned importance weights correct the bias introduced by that
+    non-uniform distribution.
+
+    Prioritised replay matters here because a level clear and a death are
+    both rare compared with eating a dot.  Uniform sampling can go many
+    batches without revisiting the few transitions that explain a clear,
+    while prioritised sampling keeps them in rotation.
+    """
+
+    def __init__(self, capacity=100_000, seed=0, prioritized=False,
+                 alpha=0.6, eps=1e-3):
         self.capacity = capacity
         self.grid = np.zeros((capacity, N_CHANNELS, GRID_H, GRID_W), dtype=np.int8)
         self.next_grid = np.zeros_like(self.grid)
@@ -34,6 +50,12 @@ class ReplayBuffer:
         self.action = np.zeros(capacity, dtype=np.int64)
         self.reward = np.zeros(capacity, dtype=np.float32)
         self.terminal = np.zeros(capacity, dtype=np.uint8)
+
+        self.prioritized = bool(prioritized)
+        self.alpha = float(alpha)
+        self.eps = float(eps)
+        self.priority = np.zeros(capacity, dtype=np.float32)
+        self.max_priority = 1.0
 
         self.pos = 0
         self.size = 0
@@ -54,16 +76,36 @@ class ReplayBuffer:
             "ghost_dir", np.zeros(GHOST_DIR_DIM, dtype=np.float32)
         )
         self.terminal[i] = float(terminal)
+        # New transitions get the current maximum priority so they are
+        # sampled at least once before their TD error is known.
+        self.priority[i] = self.max_priority
 
         self.pos = (self.pos + 1) % self.capacity
         self.size = min(self.size + 1, self.capacity)
 
-    def sample(self, batch_size):
-        idx = self.rng.integers(0, self.size, size=batch_size)
+    def sample(self, batch_size, beta=0.4):
+        if self.prioritized:
+            p = np.power(self.priority[: self.size].astype(np.float64), self.alpha)
+            total = float(p.sum())
+            if total <= 0.0:
+                idx = self.rng.integers(0, self.size, size=batch_size)
+                weights = np.ones(batch_size, dtype=np.float32)
+            else:
+                cdf = np.cumsum(p / total)
+                cdf[-1] = 1.0
+                u = self.rng.random(batch_size)
+                idx = np.searchsorted(cdf, u, side="right")
+                idx = np.minimum(idx, self.size - 1)
+                probs = p[idx] / total
+                weights = np.power(self.size * probs, -float(beta))
+                weights = (weights / weights.max()).astype(np.float32)
+        else:
+            idx = self.rng.integers(0, self.size, size=batch_size)
+            weights = None
 
         # Keep int8 on the CPU; the agent converts to float32 on the GPU.
         # This moves 4x fewer bytes over PCIe and avoids a CPU float cast.
-        return {
+        batch = {
             "grid": torch.from_numpy(self.grid[idx]),
             "vec": torch.from_numpy(self.vec[idx]),
             "ghost_dir": torch.from_numpy(self.ghost_dir[idx]),
@@ -74,6 +116,19 @@ class ReplayBuffer:
             "next_ghost_dir": torch.from_numpy(self.next_ghost_dir[idx]),
             "terminal": torch.from_numpy(self.terminal[idx]).float(),
         }
+        if weights is not None:
+            batch["weights"] = torch.from_numpy(weights)
+            batch["indices"] = torch.from_numpy(idx.astype(np.int64))
+        return batch
+
+    def update_priorities(self, indices, td_errors):
+        """Store fresh TD errors; priorities must be positive."""
+        if not self.prioritized:
+            return
+        values = np.abs(np.asarray(td_errors, dtype=np.float32)) + self.eps
+        idx = np.asarray(indices, dtype=np.int64)
+        self.priority[idx] = values
+        self.max_priority = max(self.max_priority, float(values.max()))
 
 
 class NStepAccumulator:

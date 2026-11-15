@@ -169,6 +169,23 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--danger-penalty cannot be negative")
     if args.danger_radius is not None and args.danger_radius < 0:
         raise SystemExit("--danger-radius cannot be negative")
+    if args.dots_removed_bias < 0:
+        raise SystemExit("--dots-removed-bias cannot be negative")
+    if args.death_penalty_progress is not None and args.death_penalty_progress < 0:
+        raise SystemExit("--death-penalty-progress cannot be negative")
+    if (args.level_clear_lives_bonus is not None
+            and args.level_clear_lives_bonus < 0):
+        raise SystemExit("--level-clear-lives-bonus cannot be negative")
+    if args.no_progress_limit is not None and args.no_progress_limit < 0:
+        raise SystemExit("--no-progress-limit cannot be negative")
+    if args.no_progress_penalty is not None and args.no_progress_penalty > 0:
+        raise SystemExit("--no-progress-penalty must be zero or negative")
+    if not 0.0 <= args.per_alpha <= 1.0:
+        raise SystemExit("--per-alpha must be between 0 and 1")
+    if not 0.0 <= args.per_beta <= 1.0:
+        raise SystemExit("--per-beta must be between 0 and 1")
+    if args.per_eps <= 0:
+        raise SystemExit("--per-eps must be positive")
 
 
 def parse_args() -> argparse.Namespace:
@@ -256,6 +273,37 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dots-removed-max", type=int, default=0,
                    help="endgame curriculum: maximum ordinary dots pre-removed "
                         "at each training episode reset; evaluation always uses 0")
+    p.add_argument("--dots-removed-bias", type=float, default=0.0,
+                   help="skew the endgame curriculum towards its maximum; "
+                        "0 is uniform, 1-3 makes most episodes start near the "
+                        "end of the board")
+    p.add_argument("--endgame-ramp", action="store_true",
+                   help="scale --dots-removed-min/max by generation/G, so "
+                        "early generations see full boards and later ones "
+                        "focus on the endgame")
+    p.add_argument("--death-penalty-progress", type=float, default=None,
+                   help="extra death penalty proportional to how much of the "
+                        "board was already cleared; 1.0 doubles the penalty "
+                        "at 100%% progress")
+    p.add_argument("--level-clear-lives-bonus", type=float, default=None,
+                   help="reward per spare life when a level is cleared, so a "
+                        "clean clear is worth more than a costly one")
+    p.add_argument("--no-progress-limit", type=int, default=None,
+                   help="end an episode after this many decisions without a "
+                        "pellet; 0 disables it (default)")
+    p.add_argument("--no-progress-penalty", type=float, default=None,
+                   help="terminal reward added when --no-progress-limit fires")
+    p.add_argument("--per", action="store_true",
+                   help="enable prioritised experience replay")
+    p.add_argument("--per-alpha", type=float, default=0.6,
+                   help="prioritisation exponent; 0 is uniform, 1 is fully "
+                        "proportional")
+    p.add_argument("--per-beta", type=float, default=0.4,
+                   help="initial importance-sampling exponent; it is annealed "
+                        "to 1.0 over the run")
+    p.add_argument("--per-eps", type=float, default=1e-3,
+                   help="small positive floor added to every TD error so a "
+                        "transition is never completely starved")
 
     # DQN hyperparameters.
     p.add_argument("--warmup", type=int, default=5_000,
@@ -658,6 +706,10 @@ def build_agent(args: argparse.Namespace) -> DQNAgent:
         seed=args.seed,
         use_ghost_dir=not args.no_ghost_dir,
         use_amp=not args.no_amp,
+        use_per=args.per,
+        per_alpha=args.per_alpha,
+        per_beta=args.per_beta,
+        per_eps=args.per_eps,
     )
 
 
@@ -862,6 +914,14 @@ def train(args: argparse.Namespace) -> DQNAgent:
         reward_cfg.danger_penalty = args.danger_penalty
     if args.danger_radius is not None:
         reward_cfg.danger_radius = args.danger_radius
+    if args.death_penalty_progress is not None:
+        reward_cfg.death_penalty_progress = args.death_penalty_progress
+    if args.level_clear_lives_bonus is not None:
+        reward_cfg.level_clear_lives_bonus = args.level_clear_lives_bonus
+    if args.no_progress_limit is not None:
+        reward_cfg.no_progress_limit = args.no_progress_limit
+    if args.no_progress_penalty is not None:
+        reward_cfg.no_progress_penalty = args.no_progress_penalty
     print(
         "reward: "
         f"score_scale={reward_cfg.score_scale} "
@@ -871,15 +931,25 @@ def train(args: argparse.Namespace) -> DQNAgent:
         f"dot_not_eaten_penalty={reward_cfg.dot_not_eaten_penalty} "
         f"dot_not_eaten_grace={reward_cfg.dot_not_eaten_grace} "
         f"level_clear_bonus={reward_cfg.level_clear_bonus} "
+        f"lives_bonus={reward_cfg.level_clear_lives_bonus} "
         f"ghost_score_scale={reward_cfg.ghost_score_scale} "
         f"danger_penalty={reward_cfg.danger_penalty} "
-        f"danger_radius={reward_cfg.danger_radius}"
+        f"danger_radius={reward_cfg.danger_radius} "
+        f"death_progress={reward_cfg.death_penalty_progress} "
+        f"no_progress={reward_cfg.no_progress_limit}"
     )
     print(
         f"endgame curriculum: dots removed at reset "
-        f"{args.dots_removed_min}..{args.dots_removed_max} | "
+        f"{args.dots_removed_min}..{args.dots_removed_max} "
+        f"(bias {args.dots_removed_bias}, ramp {'on' if args.endgame_ramp else 'off'}) | "
         f"ghost-direction input: {not args.no_ghost_dir}"
     )
+    if args.per:
+        print(
+            f"prioritised replay: alpha={args.per_alpha} "
+            f"beta0={args.per_beta} eps={args.per_eps}",
+            flush=True,
+        )
 
     def training_cap(generation: int) -> int | None:
         if args.curriculum:
@@ -899,6 +969,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         seed=args.seed,
         dots_removed_min=args.dots_removed_min,
         dots_removed_max=args.dots_removed_max,
+        dots_removed_bias=args.dots_removed_bias,
         reward=reward_cfg,
     ))
     agent = build_agent(args)
@@ -1013,9 +1084,13 @@ def train(args: argparse.Namespace) -> DQNAgent:
         old_cap = env.cfg.level_cap
         old_min = env.cfg.dots_removed_min
         old_max = env.cfg.dots_removed_max
+        old_no_progress = env.cfg.reward.no_progress_limit
         env.cfg.level_cap = cap
         env.cfg.dots_removed_min = 0
         env.cfg.dots_removed_max = 0
+        # The no-progress limit is a training device; evaluation must keep
+        # playing a real episode so scores stay comparable with old runs.
+        env.cfg.reward.no_progress_limit = 0
         try:
             return evaluate(
                 env,
@@ -1027,6 +1102,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
             env.cfg.level_cap = old_cap
             env.cfg.dots_removed_min = old_min
             env.cfg.dots_removed_max = old_max
+            env.cfg.reward.no_progress_limit = old_no_progress
 
     # A resumed checkpoint is generation 0 in the comparison table.  Without
     # this baseline the best-checkpoint rule can happily return a continuation
@@ -1186,17 +1262,42 @@ def train(args: argparse.Namespace) -> DQNAgent:
                 continue
 
             cap = training_cap(generation)
+            # Endgame curriculum ramp: early generations see (almost) full
+            # boards, and the final generation uses the full requested range.
+            # This stops a long run from spending most of its budget on the
+            # first half of the maze, which is already learned.
+            if args.endgame_ramp and args.generations > 1:
+                frac = generation / args.generations
+                hi = int(round(args.dots_removed_max * frac))
+                lo = int(round(args.dots_removed_min * frac))
+                env.cfg.dots_removed_min = min(lo, hi)
+                env.cfg.dots_removed_max = hi
+            else:
+                env.cfg.dots_removed_min = args.dots_removed_min
+                env.cfg.dots_removed_max = args.dots_removed_max
             env.cfg.level_cap = cap
             obs = env.reset()
             cap_text = "no cap" if cap is None else str(cap)
             print(
                 f"\n--- generation {generation}/{args.generations} | "
-                f"level cap {cap_text} | {generation_decisions:,} decisions ---",
+                f"level cap {cap_text} | {generation_decisions:,} decisions | "
+                f"endgame dots {env.cfg.dots_removed_min}"
+                f"..{env.cfg.dots_removed_max} ---",
                 flush=True,
             )
 
             for _ in range(generation_decisions):
                 global_decision += 1
+
+                # PER importance-sampling exponent anneals to 1.0, so late
+                # updates are fully corrected for the sampling bias.
+                if agent.use_per:
+                    agent.per_beta = min(
+                        1.0,
+                        args.per_beta
+                        + (1.0 - args.per_beta)
+                        * global_decision / args.total_decisions,
+                    )
 
                 # ---- choose an action ---------------------------------
                 if global_decision <= warmup:
@@ -1488,11 +1589,20 @@ def train(args: argparse.Namespace) -> DQNAgent:
         "dot_not_eaten_penalty": reward_cfg.dot_not_eaten_penalty,
         "dot_not_eaten_grace": reward_cfg.dot_not_eaten_grace,
         "level_clear_bonus": reward_cfg.level_clear_bonus,
+        "level_clear_lives_bonus": reward_cfg.level_clear_lives_bonus,
         "ghost_score_scale": reward_cfg.ghost_score_scale,
         "danger_penalty": reward_cfg.danger_penalty,
         "danger_radius": reward_cfg.danger_radius,
+        "death_penalty_progress": reward_cfg.death_penalty_progress,
+        "no_progress_limit": reward_cfg.no_progress_limit,
+        "no_progress_penalty": reward_cfg.no_progress_penalty,
         "dots_removed_min": args.dots_removed_min,
         "dots_removed_max": args.dots_removed_max,
+        "dots_removed_bias": args.dots_removed_bias,
+        "endgame_ramp": args.endgame_ramp,
+        "use_per": agent.use_per,
+        "per_alpha": args.per_alpha if agent.use_per else None,
+        "per_beta": args.per_beta if agent.use_per else None,
         "use_ghost_dir": agent.use_ghost_dir,
         "partial_load": args.partial_load,
         "width": args.width,
