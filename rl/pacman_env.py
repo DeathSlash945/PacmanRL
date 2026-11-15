@@ -95,6 +95,14 @@ class PacmanEnv:
         # A private RNG makes the curriculum deterministic for a given
         # episode seed even though the game itself uses random.seed().
         rng = np.random.default_rng((int(seed) + 0x9E3779B9) & 0xFFFFFFFF)
+        # Keep a slice of episodes on the full board.  A biased curriculum
+        # otherwise stops showing the opening, and the opening is half of a
+        # full-game evaluation.
+        full_fraction = float(
+            getattr(cfg, "dots_removed_full_fraction", 0.0)
+        )
+        if full_fraction > 0.0 and float(rng.random()) < full_fraction:
+            return
         # A bias > 0 pushes the sampled count towards the high end.  The
         # uniform default is kept for backward compatibility, but endgame
         # training wants most episodes to start with only a few pellets

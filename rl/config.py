@@ -107,6 +107,10 @@ class EnvConfig:
                dots_removed_bias > 0 skews that random count towards the
                maximum, so the agent spends more episodes in the last few
                pellets instead of mostly seeing early boards.
+               dots_removed_full_fraction keeps that fraction of episodes on
+               a full board.  Without it a high bias would train almost
+               exclusively on endgames and let the agent forget the opening,
+               which is exactly what a full-game evaluation measures.
     """
 
     frame_skip: int = 4
@@ -116,4 +120,5 @@ class EnvConfig:
     dots_removed_min: int = 0
     dots_removed_max: int = 0
     dots_removed_bias: float = 0.0
+    dots_removed_full_fraction: float = 0.0
     reward: RewardConfig = field(default_factory=RewardConfig)

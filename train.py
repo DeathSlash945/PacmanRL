@@ -8,13 +8,19 @@ the existing `rl` package instead of duplicating the environment or agents:
     python train.py --gif-frames 0 --no-watch  # training only
     python train.py --headless --no-watch       # server / smoke test
 
-    # For example a long train sesh: ten generations and level curriculum.
-    python train.py --generations 10 --total-decisions 10000000 \
-        --curriculum --curriculum-max-level 4 --max-frames 60000 \
-        --width 64 --train-every 1 --gamma 0.995 \
+    # The from-scratch recipe that reproduces the 10M run, extended with
+    # the endgame curriculum that targets level clears.  Full command in
+    # README.md, section "Clearing the board: the from-scratch run".
+    python train.py --generations 12 --total-decisions 12000000 \
+        --level-cap 1 --max-frames 60000 --width 64 \
+        --train-every 1 --batch-size 64 --target-update 2000 \
+        --gamma 0.99 --n-step 1 --replay-size 100000 \
         --epsilon-decay 1000000 --epsilon-end 0.02 \
-        --lr-final 1e-5 --eval-episodes 30 --eval-level-cap 0 \
-        --out runs/overnight
+        --lr 1e-4 --lr-final 1e-5 --eval-episodes 30 --eval-level-cap 0 \
+        --level-clear-bonus 200 --level-clear-lives-bonus 50 \
+        --dots-removed-max 200 --dots-removed-bias 3.0 \
+        --dots-removed-full-fraction 0.3 --endgame-ramp \
+        --out runs/train_dqn_clear
 
 What happens, in order
 ----------------------
@@ -171,6 +177,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--danger-radius cannot be negative")
     if args.dots_removed_bias < 0:
         raise SystemExit("--dots-removed-bias cannot be negative")
+    if not 0.0 <= args.dots_removed_full_fraction <= 1.0:
+        raise SystemExit("--dots-removed-full-fraction must be between 0 and 1")
     if args.death_penalty_progress is not None and args.death_penalty_progress < 0:
         raise SystemExit("--death-penalty-progress cannot be negative")
     if (args.level_clear_lives_bonus is not None
@@ -186,6 +194,8 @@ def validate_args(args: argparse.Namespace) -> None:
         raise SystemExit("--per-beta must be between 0 and 1")
     if args.per_eps <= 0:
         raise SystemExit("--per-eps must be positive")
+    if args.patience < 0:
+        raise SystemExit("--patience cannot be negative")
 
 
 def parse_args() -> argparse.Namespace:
@@ -203,6 +213,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--start-generation", type=int, default=None,
                    help="first generation to run; omit to auto-detect from "
                         "progress.json/run.json when --resume is used")
+    p.add_argument("--patience", type=int, default=0,
+                   help="stop early when no generation has beaten the best "
+                        "greedy evaluation for this many generations; 0 "
+                        "disables it.  This is the safety valve against "
+                        "spending hours on a stalled run")
     p.add_argument("--curriculum", action="store_true",
                    help="increase the level cap each generation: 1, 2, 3, ... "
                         "then no cap after --curriculum-max-level")
@@ -277,6 +292,10 @@ def parse_args() -> argparse.Namespace:
                    help="skew the endgame curriculum towards its maximum; "
                         "0 is uniform, 1-3 makes most episodes start near the "
                         "end of the board")
+    p.add_argument("--dots-removed-full-fraction", type=float, default=0.0,
+                   help="fraction of training episodes that keep the full "
+                        "board even when the endgame curriculum is active; "
+                        "keeps the opening learned while still practising clears")
     p.add_argument("--endgame-ramp", action="store_true",
                    help="scale --dots-removed-min/max by generation/G, so "
                         "early generations see full boards and later ones "
@@ -941,7 +960,9 @@ def train(args: argparse.Namespace) -> DQNAgent:
     print(
         f"endgame curriculum: dots removed at reset "
         f"{args.dots_removed_min}..{args.dots_removed_max} "
-        f"(bias {args.dots_removed_bias}, ramp {'on' if args.endgame_ramp else 'off'}) | "
+        f"(bias {args.dots_removed_bias}, "
+        f"full-board {args.dots_removed_full_fraction:.0%}, "
+        f"ramp {'on' if args.endgame_ramp else 'off'}) | "
         f"ghost-direction input: {not args.no_ghost_dir}"
     )
     if args.per:
@@ -970,6 +991,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         dots_removed_min=args.dots_removed_min,
         dots_removed_max=args.dots_removed_max,
         dots_removed_bias=args.dots_removed_bias,
+        dots_removed_full_fraction=args.dots_removed_full_fraction,
         reward=reward_cfg,
     ))
     agent = build_agent(args)
@@ -1078,6 +1100,9 @@ def train(args: argparse.Namespace) -> DQNAgent:
     best_generation = None
     best_eval = None
     best_source = None
+    # --patience: number of consecutive generations without a new best.
+    stale_generations = 0
+    stop_training = False
 
     def run_eval(cap: int | None) -> dict:
         """Evaluate with the endgame curriculum disabled and cap restored."""
@@ -1462,6 +1487,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
                     best_generation = generation
                     best_eval = generation_result
                     best_source = "generation"
+                    stale_generations = 0
                     agent.save(out / "best.pt")
                     (out / "best.json").write_text(json.dumps({
                         "generation": generation,
@@ -1478,6 +1504,19 @@ def train(args: argparse.Namespace) -> DQNAgent:
                         f"clears {generation_result['clears_mean']:.2f})",
                         flush=True,
                     )
+                else:
+                    stale_generations += 1
+                    if args.patience and stale_generations >= args.patience:
+                        stop_training = True
+                        print(
+                            f"early stop: no new best checkpoint for "
+                            f"{stale_generations} generations "
+                            f"(--patience {args.patience}); best is "
+                            f"generation {best_generation} "
+                            f"(dots {best_eval['dots_mean']:.1f}, "
+                            f"clears {best_eval['clears_mean']:.2f})",
+                            flush=True,
+                        )
 
                 # Evaluation resets the shared game; start the next
                 # generation from a fresh episode.
@@ -1498,6 +1537,8 @@ def train(args: argparse.Namespace) -> DQNAgent:
             (out / "progress.json").write_text(
                 json.dumps(progress, indent=2) + "\n"
             )
+            if stop_training:
+                break
 
     except KeyboardInterrupt:
         interrupted = True
@@ -1577,6 +1618,8 @@ def train(args: argparse.Namespace) -> DQNAgent:
         "start_generation": start_generation,
         "curriculum": args.curriculum,
         "curriculum_max_level": args.curriculum_max_level,
+        "patience": args.patience,
+        "early_stopped": bool(stop_training),
         "interrupted": interrupted,
         "seed": args.seed,
         "frame_skip": args.frame_skip,
@@ -1599,6 +1642,7 @@ def train(args: argparse.Namespace) -> DQNAgent:
         "dots_removed_min": args.dots_removed_min,
         "dots_removed_max": args.dots_removed_max,
         "dots_removed_bias": args.dots_removed_bias,
+        "dots_removed_full_fraction": args.dots_removed_full_fraction,
         "endgame_ramp": args.endgame_ramp,
         "use_per": agent.use_per,
         "per_alpha": args.per_alpha if agent.use_per else None,

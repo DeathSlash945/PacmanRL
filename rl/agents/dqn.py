@@ -116,11 +116,13 @@ class DQNAgent:
                 .unsqueeze(0)
                 .to(self.device)
             )
-        with torch.inference_mode(), torch.autocast(
-            device_type=self.device.type,
-            dtype=self.amp_dtype,
-            enabled=self.use_amp,
-        ):
+        # Greedy inference is deliberately float32 even when training uses
+        # AMP.  bf16 keeps only 8 mantissa bits, and late in training the
+        # Q-values of two actions are often within that error.  A single
+        # flipped turn is enough to send Pac-Man into a ghost, so bf16
+        # argmax silently turns a 170-pellet policy into a 100-pellet one.
+        # One-sample inference is cheap; correctness matters more here.
+        with torch.inference_mode():
             q = self.online(grid, vec, ghost_dir)
         return int(q.argmax(dim=1).item())
 
@@ -150,6 +152,10 @@ class DQNAgent:
         next_vec = batch["next_vec"].to(self.device)
         terminal = batch["terminal"].to(self.device)
 
+        # The online Q is evaluated with autocast for speed.  The
+        # Double-DQN target, however, is computed in float32: bf16 argmax
+        # over near-tied next-state actions flips easily, and a noisy
+        # bootstrap target is worse than a slightly slower gradient step.
         with torch.autocast(
             device_type=self.device.type,
             dtype=self.amp_dtype,
@@ -159,31 +165,35 @@ class DQNAgent:
                 1, action.unsqueeze(1)
             ).squeeze(1)
 
-            with torch.no_grad():
-                # Double DQN: online net picks the action, target net scores it.
-                next_actions = self.online(
-                    next_grid, next_vec, next_ghost_dir
-                ).argmax(dim=1, keepdim=True)
-                next_q = self.target(
-                    next_grid, next_vec, next_ghost_dir
-                ).gather(1, next_actions).squeeze(1)
-                target = reward + self.gamma * next_q * (1.0 - terminal)
+        with torch.no_grad(), torch.autocast(
+            device_type=self.device.type,
+            dtype=self.amp_dtype,
+            enabled=False,
+        ):
+            # Double DQN: online net picks the action, target net scores it.
+            next_actions = self.online(
+                next_grid, next_vec, next_ghost_dir
+            ).argmax(dim=1, keepdim=True)
+            next_q = self.target(
+                next_grid, next_vec, next_ghost_dir
+            ).gather(1, next_actions).squeeze(1)
+            target = reward + self.gamma * next_q * (1.0 - terminal)
 
-            # The loss itself is computed in float32 so a rare large target
-            # cannot overflow the reduced-precision forward pass.
-            q_float = q.float()
-            target_float = target.float()
-            loss_per_sample = F.smooth_l1_loss(
-                q_float, target_float, reduction="none"
-            )
-            td_error = (target_float - q_float).detach()
-            if "weights" in batch:
-                # Prioritised replay is biased towards high-error
-                # transitions; importance weights undo that bias.
-                weights = batch["weights"].to(self.device)
-                loss = (loss_per_sample * weights).mean()
-            else:
-                loss = loss_per_sample.mean()
+        # The loss itself is computed in float32 so a rare large target
+        # cannot overflow the reduced-precision forward pass.
+        q_float = q.float()
+        target_float = target.float()
+        loss_per_sample = F.smooth_l1_loss(
+            q_float, target_float, reduction="none"
+        )
+        td_error = (target_float - q_float).detach()
+        if "weights" in batch:
+            # Prioritised replay is biased towards high-error
+            # transitions; importance weights undo that bias.
+            weights = batch["weights"].to(self.device)
+            loss = (loss_per_sample * weights).mean()
+        else:
+            loss = loss_per_sample.mean()
 
         self.optimizer.zero_grad(set_to_none=True)
         if self.scaler.is_enabled():

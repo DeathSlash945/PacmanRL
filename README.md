@@ -63,10 +63,12 @@ The latest 10M-decision curriculum run (preserved in
 `runs/train_dqn_curriculum/`) scores **2129.0 +/- 368.9** on 30 fixed seeds,
 eats **171.7 of 244 pellets**, and still clears **0 levels**.  It is better
 than the original 1M checkpoint (1981.7 +/- 368.6 on the same 30 seeds),
-but it is not a clear.  The next run therefore starts from that best
-checkpoint and adds three targeted changes: ghost-direction observations,
-an endgame dot-removal curriculum, and reward shaping that makes ghost
-chasing less dominant.
+but it is not a clear.  A later from-scratch attempt looked much worse
+(994.7 at its best generation), but most of that gap was an evaluation bug:
+greedy inference was running in bf16, which flips near-tied actions and
+turned the same 2129-point checkpoint into a 1256-point one.  Inference is
+now float32.  The from-scratch recipe that reaches 2129 is reproduced below
+and extended with an endgame curriculum that targets the missing clears.
 
 The report is written automatically at the end of every run:
 
@@ -132,108 +134,120 @@ record a fresh demo after training, use
 `python -m rl.record --agent dqn --checkpoint runs/train_dqn_finetune/best.pt
 --out runs/train_dqn_finetune/demo.gif --frames 6000`.
 
-### Clearing the board: the strategy run
+### Clearing the board: the from-scratch run
 
-The fine-tune above keeps the 2129-point policy, but that policy has never
-cleared level 1: it eats about 170 of 244 pellets and loses its three
-lives.  The strategy run targets exactly that gap.  It adds:
+The 10M curriculum policy is a strong survivor but not a finisher: it eats
+about 170 of 244 pellets and loses all three lives.  The from-scratch run
+below targets the clear, and fixes two things that made the previous
+attempt look much worse than it was:
 
-- **A clear bonus on every level clear.**  Previously the bonus was only
-  paid when a *capped* episode ended, so a full-game episode (and every
-  evaluation) never received it.  That removed the main reward for
-  finishing a board.
+- **Greedy inference is float32.**  `DQNAgent.act()` used the training
+  autocast context.  bf16 keeps only 8 mantissa bits, and late in training
+  two actions often have Q-values within that error, so a single flipped
+  turn sent Pac-Man into a ghost.  The same 10M checkpoint evaluated at
+  1256.0 score / 98.0 pellets with bf16 and at exactly 2129.0 / 171.7 in
+  float32.  Every generation evaluation and `best.pt` choice made since AMP
+  was added was therefore based on a corrupted policy.  Inference and the
+  Double-DQN bootstrap target now run in float32.
+- **The learning schedule is the proven one.**  The failed run used
+  `--epsilon-decay 5000000`, so epsilon was still 0.80 at 1M decisions and
+  only reached 0.02 at 5M: the first five generations trained on mostly
+  random actions.  The recipe below uses `--epsilon-decay 1000000`,
+  `--train-every 1`, `--batch-size 64`, `--gamma 0.99`,
+  `--target-update 2000`, `--max-frames 60000` and `--warmup 0`, which is
+  the 10M run that reached 2129.0.
+
+On top of that it adds the clear-specific shaping:
+
+- **A clear bonus on every level clear.**  It used to be paid only when a
+  *capped* episode ended, so a full-game episode (and every evaluation)
+  never received it.
 - **Progress-scaled death penalty.**  Dying at 240/244 pellets costs twice
-  as much as dying at the start, so a nearly-finished board is protected.
-- **Lives bonus on a clear.**  A clean clear is worth more than one that
-  cost two deaths.
-- **An endgame curriculum ramp with a high bias.**  Early generations see
-  full boards; later ones mostly start with only a few pellets left, which
-  is where the old agent always died.
-- **Prioritised replay (PER).**  Clears and deaths are rare; PER keeps the
-  transitions that explain them in rotation.
+  as much as dying at the start.
+- **Lives bonus on a clear**, so a clean clear beats a costly one.
+- **An endgame curriculum.**  `--endgame-ramp` scales the dot-removal range
+  by generation, `--dots-removed-bias 3` makes late episodes start near the
+  end of the board, and `--dots-removed-full-fraction 0.3` keeps 30% of
+  episodes on a full board so the opening is not forgotten.
 - **A no-progress limit.**  Loitering without eating a pellet ends the
-  episode instead of collecting step penalties forever.  Evaluation
-  disables it, so scores stay comparable.
+  episode.  Evaluation disables it, so scores stay comparable.
 
 ```bash
 PY=/home/deathslash/venvs/mlasgn/bin/python
 $PY train.py \
-  --resume-from runs/train_dqn_curriculum/best.pt --partial-load \
-  --warmstart-buffer 100000 --warmstart-epsilon 0.05 \
   --generations 12 --total-decisions 12000000 \
-  --curriculum --curriculum-max-level 2 \
-  --max-frames 30000 --width 64 \
-  --n-step 3 --train-every 2 --batch-size 256 --target-update 1000 \
-  --gamma 0.995 --replay-size 200000 \
-  --epsilon-start 0.1 --reset-epsilon \
-  --epsilon-decay 4000000 --epsilon-end 0.02 \
-  --lr 3e-5 --lr-final 1e-6 --eval-episodes 50 --eval-level-cap 0 \
-  --ghost-score-scale 0.4 --danger-penalty 0.02 --danger-radius 5 \
-  --death-penalty -20 --death-penalty-progress 1.0 \
-  --level-clear-bonus 100 --level-clear-lives-bonus 25 \
-  --stay-penalty -0.03 --step-penalty -0.005 \
+  --level-cap 1 --frame-skip 4 --max-frames 60000 --width 64 \
+  --warmup 0 --train-every 1 --batch-size 64 --target-update 2000 \
+  --gamma 0.99 --n-step 1 --replay-size 100000 \
+  --epsilon-start 1.0 --epsilon-decay 1000000 --epsilon-end 0.02 \
+  --lr 1e-4 --lr-final 1e-5 \
+  --eval-episodes 30 --eval-level-cap 0 \
+  --ghost-score-scale 0.5 --danger-penalty 0.02 --danger-radius 5 \
+  --death-penalty -15 --death-penalty-progress 1.0 \
+  --level-clear-bonus 200 --level-clear-lives-bonus 50 \
+  --stay-penalty -0.02 --step-penalty -0.005 \
   --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
-  --no-progress-limit 400 --no-progress-penalty -10 \
+  --no-progress-limit 1000 --no-progress-penalty -10 \
   --dots-removed-min 0 --dots-removed-max 200 \
-  --dots-removed-bias 2.0 --endgame-ramp \
-  --per --per-alpha 0.6 --per-beta 0.4 \
-  --save-every 1000000 --log-every 100000 \
-  --gif-frames 0 --out runs/train_dqn_strategy
+  --dots-removed-bias 3.0 --dots-removed-full-fraction 0.3 \
+  --endgame-ramp --patience 4 \
+  --save-every 500000 --log-every 50000 \
+  --gif-frames 0 --out runs/train_dqn_clear
 ```
 
-Do not run all 12M blindly.  Read `runs/train_dqn_strategy/eval_gen*.json`
-after generation 3-4 (roughly 3-4M decisions):
+`--level-cap 1` means every training episode is one board: clearing it
+ends the episode and pays the bonus, which is exactly the signal we want.
+Evaluation ignores the cap (`--eval-level-cap 0`) and plays the full game
+on 30 fixed seeds, so the numbers stay comparable with older runs.
 
-- pellets rising generation over generation and `clears_mean` becoming
-  nonzero: keep going;
-- pellets flat or falling for three generations: stop, and either lower
-  `--lr` further or reduce `--dots-removed-bias` so the agent still sees
-  full boards.
+This is roughly 16-18 hours on this GPU (about 190 decisions/s) plus about
+three minutes of evaluation per generation.  Do not wait for the end:
 
-If the run is improving and you want to extend it, reuse the same reward
-and algorithm flags with `--resume`, a larger generation count and an
-explicit endgame range (drop `--endgame-ramp`, which is defined relative to
-the current `--generations`):
+- after generation 3-4 (3-4M decisions, ~5 h) open
+  `runs/train_dqn_clear/eval_gen*.json`;
+- if `dots_mean` is climbing, keep going; `clears_mean` turning nonzero is
+  the signal that the endgame curriculum is working;
+- if it is flat or falling for three generations, stop.  `--patience 4`
+  also stops automatically after four generations without a new best.
+
+The best checkpoint is chosen by clears first, then pellets, then score, so
+a generation that clears one board is kept even if its average score is
+lower.  `best.pt` is what the final evaluation and the live game use.
+
+If the run reaches ~200 pellets but still does not clear, resume it with a
+harder endgame (fewer dots removed) and a larger full-board share.  Reward
+and DQN flags are not read from `run.json`, so repeat them:
 
 ```bash
-$PY train.py --resume --generations 24 --total-decisions 12000000 \
-  --warmstart-buffer 50000 --warmstart-epsilon 0.05 \
-  --curriculum --curriculum-max-level 2 --max-frames 30000 --width 64 \
-  --n-step 3 --train-every 2 --batch-size 256 --target-update 1000 \
-  --gamma 0.995 --replay-size 200000 \
-  --epsilon-end 0.02 --epsilon-decay 4000000 \
-  --lr 3e-5 --lr-final 1e-6 --eval-episodes 50 --eval-level-cap 0 \
-  --ghost-score-scale 0.4 --danger-penalty 0.02 --danger-radius 5 \
-  --death-penalty -20 --death-penalty-progress 1.0 \
-  --level-clear-bonus 100 --level-clear-lives-bonus 25 \
-  --stay-penalty -0.03 --step-penalty -0.005 \
+$PY train.py --resume --generations 18 --total-decisions 6000000 \
+  --level-cap 1 --frame-skip 4 --max-frames 60000 --width 64 \
+  --warmup 0 --train-every 1 --batch-size 64 --target-update 2000 \
+  --gamma 0.99 --n-step 1 --replay-size 100000 \
+  --epsilon-end 0.02 --epsilon-decay 1000000 \
+  --lr 5e-5 --lr-final 1e-6 \
+  --eval-episodes 30 --eval-level-cap 0 \
+  --ghost-score-scale 0.5 --danger-penalty 0.02 --danger-radius 5 \
+  --death-penalty -15 --death-penalty-progress 1.0 \
+  --level-clear-bonus 300 --level-clear-lives-bonus 75 \
+  --stay-penalty -0.02 --step-penalty -0.005 \
   --dot-not-eaten-penalty -0.02 --dot-not-eaten-grace 45 \
-  --no-progress-limit 400 --no-progress-penalty -10 \
-  --dots-removed-min 120 --dots-removed-max 200 --dots-removed-bias 2 \
-  --per --per-alpha 0.6 --per-beta 0.4 \
-  --out runs/train_dqn_strategy
+  --no-progress-limit 1000 --no-progress-penalty -10 \
+  --dots-removed-min 0 --dots-removed-max 120 \
+  --dots-removed-bias 2.0 --dots-removed-full-fraction 0.5 \
+  --patience 4 --save-every 500000 --log-every 50000 \
+  --gif-frames 0 --out runs/train_dqn_clear
 ```
 
 `--resume` continues at the next unfinished generation and splits the new
-budget across generations 13-24.  Reward and DQN settings are **not** read
-from `run.json`, so they must be repeated; otherwise the defaults in
-`rl/config.py` silently replace the strategy values.
+budget across generations 13-18.  Drop `--endgame-ramp` on a resume: it is
+defined relative to the current `--generations`, so re-enabling it would
+send the agent back to full boards.
 
-The best checkpoint is selected by clears first, then pellets, then score,
-so a worse-scoring generation can still be kept if it clears more.
-
-If you want more than one candidate per wall-clock hour, launch two or
-three independent fine-tunes in parallel.  They share the GPU and use
-different CPU cores; each writes its own run directory, so you can compare
-`eval.json` afterwards:
-
-```bash
-scripts/train_parallel.sh 3 10000000   # 3 candidates, 10M decisions each
-```
-
-The helper disables the GIF and live window for candidates, uses the same
-fine-tuning recipe, and varies `ghost_score_scale`, `danger_penalty` and the
-endgame dot range so the runs are not identical.
+The fine-tuning recipe that starts from
+`runs/train_dqn_curriculum/best.pt` is still useful when wall-clock time
+matters more than a true from-scratch result, but its reported numbers were
+produced with the bf16 inference bug.  Re-evaluate any checkpoint with the
+current code before comparing it.
 
 What the important flags mean:
 
@@ -248,7 +262,9 @@ What the important flags mean:
 | `--curriculum-max-level K` | After level K, later generations play the full game |
 | `--dots-removed-min/max` | Endgame curriculum: each training episode starts with a random number of ordinary dots already gone (power pellets stay) |
 | `--dots-removed-bias` | Skew that random count towards the maximum; 2-3 makes most episodes start near the end of the board |
+| `--dots-removed-full-fraction` | Fraction of episodes that keep a full board while the endgame curriculum is active; stops the agent forgetting the opening |
 | `--endgame-ramp` | Scale the dot-removal range by generation, so early generations see full boards and later ones focus on the endgame |
+| `--patience N` | Stop after N generations without a new best greedy evaluation; 0 disables it |
 | `--death-penalty-progress` | Extra death penalty proportional to how much of the board was cleared; 1.0 doubles it at 100% |
 | `--level-clear-lives-bonus` | Reward per spare life when a level is cleared |
 | `--no-progress-limit`, `--no-progress-penalty` | End an episode after N decisions without a pellet; evaluation disables this so scores stay comparable |
@@ -259,14 +275,14 @@ What the important flags mean:
 | `--eval-level-cap 0` | Evaluate every generation on the full game, not just the training cap |
 | `--warmstart-buffer N` | On resume, fill the replay buffer with N decisions from the loaded policy before any gradient step; the cheapest defence against catastrophic forgetting |
 | `--warmstart-epsilon` | Exploration used only while filling that buffer (0.05 is enough) |
-| `--epsilon-start` | Starting epsilon for a fresh run or `--reset-epsilon`; use 0.1 to fine-tune, not 1.0 |
-| `--n-step N` | Store N-step returns (3 is a good compromise); gives sparse deaths and clears a shorter credit path |
-| `--train-every N` + `--batch-size M` | Fewer, larger GPU updates.  2/256 has the same samples per decision as 1/128 but much better GPU utilisation |
-| `--gamma 0.995` | Keep the checkpoint's horizon when fine-tuning; changing gamma changes every Q-target |
-| `--lr`, `--lr-final` | Fine-tune with `3e-5 -> 1e-6`, not the fresh-run `1e-4` |
-| `--epsilon-decay` | Spend longer exploring; important for a multi-million-decision run |
+| `--epsilon-start` | Starting epsilon for a fresh run or `--reset-epsilon`; use 1.0 from scratch, 0.1 to fine-tune |
+| `--n-step N` | Store N-step returns.  1 matches the 10M run; 3 gives sparse deaths and clears a shorter credit path but was not stable in the from-scratch attempt |
+| `--train-every N` + `--batch-size M` | Updates per decision and batch size.  `1`/`64` is the proven from-scratch schedule; 2/256 is a faster fine-tuning schedule |
+| `--gamma` | 0.99 for from-scratch (the 10M run); keep the checkpoint's horizon when fine-tuning |
+| `--lr`, `--lr-final` | From scratch `1e-4 -> 1e-5`; fine-tune `3e-5 -> 1e-6` |
+| `--epsilon-decay` | Decisions to reach `--epsilon-end`.  1M is the proven from-scratch value; 4-5M wastes the early generations on random actions |
 | `--reset-epsilon` | When resuming, restart exploration from `--epsilon-start` instead of keeping the checkpoint's low epsilon |
-| `--no-amp` | Disable CUDA mixed precision (AMP is on by default and roughly 1.5x faster) |
+| `--no-amp` | Disable CUDA mixed precision for training (AMP is on by default and about 1.2x faster; greedy inference is always float32) |
 | `--no-ghost-dir` | Disable the 16 ghost-direction inputs (they are on by default for new runs) |
 | `--no-best` | Use the final checkpoint instead of the best evaluated one |
 | `--no-live` | Skip the final live game; useful for background or parallel candidates |

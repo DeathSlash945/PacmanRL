@@ -11,8 +11,10 @@ import time
 os.environ.setdefault("SDL_VIDEODRIVER", "dummy")
 
 import numpy as np
+import torch
 
 import map as maze
+from .agents.dqn import DQNAgent
 from .buffer import NStepAccumulator, ReplayBuffer
 from .config import GHOST_DIR_DIM, EnvConfig, RewardConfig
 from .pacman_env import PacmanEnv
@@ -392,6 +394,53 @@ def test_no_progress_limit():
     print("ok  no-progress termination")
 
 
+def test_dot_curriculum_full_fraction():
+    cfg = EnvConfig(
+        frame_skip=4, max_frames=18000, level_cap=1,
+        dots_removed_min=0, dots_removed_max=200,
+        dots_removed_bias=3.0, dots_removed_full_fraction=1.0,
+    )
+    env = PacmanEnv(cfg)
+    for seed in range(8):
+        env.reset(seed=seed)
+        assert env.dots_removed == 0, (seed, env.dots_removed)
+    cfg.dots_removed_full_fraction = 0.0
+    env = PacmanEnv(cfg)
+    removed = []
+    for seed in range(40):
+        env.reset(seed=seed)
+        removed.append(env.dots_removed)
+    assert np.mean(removed) > 130.0, np.mean(removed)
+    print("ok  full-board slice of the endgame curriculum")
+
+
+def test_greedy_inference_is_fp32():
+    """bf16 argmax flips near-tied actions and silently ruins the policy."""
+    agent = DQNAgent(
+        device="cpu", width=8, use_ghost_dir=False, seed=0, use_amp=True
+    )
+    # Force the AMP branch on even though the device is CPU.
+    agent.use_amp = True
+    agent.amp_dtype = torch.bfloat16
+    seen = {}
+
+    def record(module, args):
+        seen["autocast"] = torch.is_autocast_enabled()
+
+    handle = agent.online.register_forward_pre_hook(record)
+    obs = {
+        "grid": np.zeros((8, 31, 28), dtype=np.float32),
+        "vec": np.zeros(18, dtype=np.float32),
+        "ghost_dir": np.zeros(GHOST_DIR_DIM, dtype=np.float32),
+    }
+    try:
+        agent.act(obs, greedy=True)
+    finally:
+        handle.remove()
+    assert seen.get("autocast") is False, seen
+    print("ok  greedy inference runs in float32")
+
+
 def test_dot_curriculum_bias():
     cfg = EnvConfig(
         frame_skip=4, max_frames=18000, level_cap=1,
@@ -448,6 +497,8 @@ if __name__ == "__main__":
     test_ghost_direction_observation()
     test_dot_curriculum()
     test_dot_curriculum_bias()
+    test_dot_curriculum_full_fraction()
+    test_greedy_inference_is_fp32()
     test_nstep_accumulator()
     test_prioritized_replay()
     test_progress_death_penalty()

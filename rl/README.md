@@ -122,8 +122,8 @@ Defaults in `config.RewardConfig`:
 | power pellet | `+50 * 0.02 = +1.0` |
 | ghost | `+200/400/800/1600 * 0.02 * ghost_score_scale` (`scale=0.5` by default) |
 | fruit | score value `* 0.02` |
-| death | `death_penalty`; the strategy run uses `-20`, scaled by `1 + progress` |
-| level clear | `level_clear_bonus` on **every** clear; strategy run `+100` plus `+25` per spare life |
+| death | `death_penalty`; the clearing run uses `-15`, scaled by `1 + progress` |
+| level clear | `level_clear_bonus` on **every** clear; clearing run `+200` plus `+50` per spare life |
 | stays still for one decision | `-0.02` |
 | no dot for 45 decisions | `-0.02` per decision until the next dot |
 | no dot for 400 decisions | episode ends with `-10` (`no_progress_limit`) |
@@ -241,7 +241,10 @@ three of these runs with different reward settings and writes each to
 - `--dots-removed-bias` skews that per-episode count towards the maximum,
   and `--endgame-ramp` scales the whole range by generation.  Together
   they let early generations see full boards and later ones concentrate
-  on the last few pellets.
+  on the last few pellets.  `--dots-removed-full-fraction` keeps that
+  fraction of episodes on a full board so the opening is not forgotten.
+- `--patience N` stops the run after N generations without a new best
+  `(clears, pellets, score)` evaluation; 0 disables it.
 - `--death-penalty-progress` multiplies the death penalty by
   `1 + progress`, and `--level-clear-lives-bonus` pays extra for each
   spare life at a clear.  The clear bonus itself is now paid on every

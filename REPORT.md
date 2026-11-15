@@ -94,8 +94,8 @@ Reward defaults in `rl/config.py`:
 | power pellet | +1.0 |
 | ghost | +4 / +8 / +16 / +32, scaled by `ghost_score_scale=0.5` |
 | fruit | score value x 0.02 |
-| death | -15 by default; the strategy run uses -20, doubled at full board progress (`death_penalty_progress=1.0`) |
-| level clear | +20 by default; the strategy run uses +100, plus +25 per spare life |
+| death | -15 by default; the clearing run uses -15, doubled at full board progress (`death_penalty_progress=1.0`) |
+| level clear | +20 by default; the clearing run uses +200, plus +50 per spare life |
 | no movement for one decision | -0.02 |
 | no dot for 45 decisions | -0.02 per decision until the next dot |
 | no dot for 400 decisions | episode ends with -10 (`no_progress_limit`) |
@@ -284,31 +284,53 @@ throughput, but 10M decisions is still the dominant cost.  For a broader
 search, `scripts/train_parallel.sh 3 10000000` runs three reward variants in
 parallel and leaves their `eval.json` files for comparison.
 
-### Clearing the board: the strategy run
+### Clearing the board: the from-scratch run
 
-The 10M curriculum policy is the strongest checkpoint so far, but it still
-loses all three lives around 170/244 pellets.  Three changes address that
-failure directly:
+Two problems explain the weak from-scratch attempt that peaked at 994.7
+score / 89.5 pellets in generation 3:
 
-1. **The clear bonus is now paid on every level clear.**  It used to be
-   added only when a capped episode ended, so a full-game episode (and
-   every evaluation) never received it.  The agent had no reward for
-   finishing a board in exactly the setting that is evaluated.
-2. **Deaths scale with progress.**  `death_penalty_progress=1.0` doubles
-   the death penalty on a board that is already 100% eaten, so protecting
-   a nearly-finished level is worth more than the remaining pellets.
-3. **The endgame curriculum is ramped and biased.**  `--endgame-ramp`
-   makes early generations see full boards and later ones focus on the
-   endgame; `--dots-removed-bias 2` makes most of those late episodes
-   start with only a few pellets left.  Prioritised replay keeps the rare
-   clear/death transitions in rotation, and `--no-progress-limit 400`
-   turns endless loitering into a terminal failure (evaluation disables
-   the limit so scores stay comparable).
+1. **Greedy inference ran in bf16.**  `DQNAgent.act()` reused the training
+   autocast context.  bf16 has 8 mantissa bits, and near the end of
+   training the Q-values of two actions are frequently closer than that
+   error.  A single flipped turn is fatal.  Loading
+   `runs/train_dqn_curriculum/best.pt` with the old code evaluated at
+   **1256.0 / 98.0**; the same checkpoint with float32 inference evaluates
+   at exactly its recorded **2129.0 / 171.7**.  Every generation
+   evaluation and every `best.pt` decision made since AMP was added was
+   therefore based on a corrupted policy.  Inference and the Double-DQN
+   bootstrap target now run in float32; training still uses AMP for the
+   online forward/backward pass.
+2. **The exploration schedule wasted half the budget.**  The failed run
+   used `--epsilon-decay 5000000`, so epsilon was 0.80 at 1M decisions and
+   only reached 0.02 at 5M.  Five of the six completed generations trained
+   on mostly random actions.  The proven 10M run reached epsilon 0.02
+   after 1M decisions.
 
-The full command is in `README.md` under "Clearing the board: the strategy
-run".  Do not spend the whole 20M budget without checking the generation
-table: if pellets are not rising by generation 3-4, stop and reduce the
-learning rate or the curriculum bias instead of waiting for the end.
+The corrected from-scratch recipe therefore copies the 10M run's optimiser
+settings: `--epsilon-decay 1000000`, `--train-every 1`, `--batch-size 64`,
+`--gamma 0.99`, `--target-update 2000`, `--max-frames 60000`,
+`--warmup 0`, `--replay-size 100000`, `--lr 1e-4 -> 1e-5`.  It adds the
+clear-specific changes:
+
+- the clear bonus is paid on **every** level clear, not only when a capped
+  episode ends;
+- `death_penalty_progress=1.0` makes losing a nearly-finished board cost
+  twice as much;
+- `level_clear_lives_bonus` pays for each spare life at a clear;
+- the endgame curriculum is ramped, biased towards the last pellets, and
+  keeps a fixed fraction of full-board episodes so the opening is not
+  forgotten;
+- `--no-progress-limit` turns endless loitering into a terminal failure
+  (evaluation disables it so scores stay comparable);
+- `--patience N` stops the run when the greedy evaluation has not improved
+  for N generations.
+
+`--level-cap 1` keeps every training episode to a single board, so a clear
+ends the episode and pays the bonus.  Evaluation ignores the cap and runs
+the full game on 30 fixed seeds.  The full command is in `README.md` under
+"Clearing the board: the from-scratch run".  Expect roughly 16-18 hours
+for 12M decisions on the RTX 4060, and check `eval_gen3.json` /
+`eval_gen4.json` before committing to the rest.
 
 The output directory contains:
 
